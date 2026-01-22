@@ -265,6 +265,7 @@ test {
     _ = ModuleGraph;
     _ = @import("rules.zig");
     _ = @import("doc_comments.zig");
+    _ = @import("TypeResolver.zig");
 }
 
 test "parseLibDirFromZigEnv" {
