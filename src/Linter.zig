@@ -11,6 +11,7 @@ source: [:0]const u8,
 path: []const u8,
 tree: Ast,
 diagnostics: std.ArrayListUnmanaged(Diagnostic),
+seen_imports: std.StringHashMapUnmanaged(Ast.TokenIndex),
 
 pub const Diagnostic = struct {
     path: []const u8,
@@ -38,12 +39,14 @@ pub fn init(allocator: std.mem.Allocator, source: [:0]const u8, path: []const u8
         .path = path,
         .tree = Ast.parse(allocator, source, .zig) catch unreachable,
         .diagnostics = .empty,
+        .seen_imports = .empty,
     };
 }
 
 pub fn deinit(self: *Linter) void {
     self.tree.deinit(self.allocator);
     self.diagnostics.deinit(self.allocator);
+    self.seen_imports.deinit(self.allocator);
 }
 
 pub fn lint(self: *Linter) void {
@@ -146,6 +149,33 @@ fn checkVarDecl(self: *Linter, node: Ast.Node.Index) void {
                 self.report(loc, .Z004, name);
             }
         }
+    }
+
+    self.checkDupeImport(var_decl, name_token);
+}
+
+fn checkDupeImport(self: *Linter, var_decl: Ast.full.VarDecl, name_token: Ast.TokenIndex) void {
+    const init_node = var_decl.ast.init_node.unwrap() orelse return;
+
+    // Check if this is a @import call
+    const main_token = self.tree.nodeMainToken(init_node);
+    const builtin_name = self.tree.tokenSlice(main_token);
+    if (!std.mem.eql(u8, builtin_name, "@import")) return;
+
+    // Get the import argument
+    var buf: [2]Ast.Node.Index = undefined;
+    const params = self.tree.builtinCallParams(&buf, init_node) orelse return;
+    if (params.len == 0) return;
+
+    const arg_token = self.tree.nodeMainToken(params[0]);
+    const import_path = self.tree.tokenSlice(arg_token);
+
+    // Check for duplicate
+    if (self.seen_imports.get(import_path)) |_| {
+        const loc = self.tree.tokenLocation(0, name_token);
+        self.report(loc, .Z007, import_path);
+    } else {
+        self.seen_imports.put(self.allocator, import_path, name_token) catch {};
     }
 }
 
@@ -643,4 +673,40 @@ test "inline ignore: multiple preceding with other comments" {
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(0, linter.diagnostics.items.len);
+}
+
+// =============================================================================
+// Duplicate import (Z007)
+// =============================================================================
+
+test "Z007: duplicate import" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const std2 = @import("std");
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnostics.items.len);
+    try std.testing.expectEqual(rules.Rule.Z007, linter.diagnostics.items[0].rule);
+}
+
+test "Z007: different imports allowed" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const foo = @import("foo.zig");
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnostics.items.len);
+}
+
+test "Z007: multiple duplicates" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const std2 = @import("std");
+        \\const std3 = @import("std");
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(2, linter.diagnostics.items.len);
 }

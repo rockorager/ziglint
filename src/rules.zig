@@ -7,6 +7,7 @@ pub const Rule = enum(u16) {
     Z004 = 4,
     Z005 = 5,
     Z006 = 6,
+    Z007 = 7,
 
     pub fn code(self: Rule) []const u8 {
         return @tagName(self);
@@ -20,6 +21,7 @@ pub const Rule = enum(u16) {
             .Z004 => try writer.print("prefer 'const {s}: T = .{{}}' over 'const {s} = T{{}}'", .{ context, context }),
             .Z005 => try writer.print("type function '{s}' should be PascalCase", .{context}),
             .Z006 => try writer.print("variable '{s}' should be snake_case", .{context}),
+            .Z007 => try writer.print("duplicate import '{s}'", .{context}),
         }
     }
 };
