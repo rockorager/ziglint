@@ -16,6 +16,7 @@ diagnostics: std.ArrayListUnmanaged(Diagnostic),
 seen_imports: std.StringHashMapUnmanaged(Ast.TokenIndex),
 type_resolver: ?*TypeResolver = null,
 module_path: ?[]const u8 = null,
+allocated_contexts: std.ArrayListUnmanaged([]const u8) = .empty,
 
 pub const Diagnostic = struct {
     path: []const u8,
@@ -67,6 +68,10 @@ pub fn initWithSemantics(
 }
 
 pub fn deinit(self: *Linter) void {
+    for (self.allocated_contexts.items) |ctx| {
+        self.allocator.free(ctx);
+    }
+    self.allocated_contexts.deinit(self.allocator);
     self.tree.deinit(self.allocator);
     self.diagnostics.deinit(self.allocator);
     self.seen_imports.deinit(self.allocator);
@@ -316,7 +321,13 @@ fn checkDeprecatedCall(self: *Linter, node: Ast.Node.Index) void {
 
     if (containsDeprecated(doc)) {
         const loc = self.tree.tokenLocation(0, method_token);
-        self.report(loc, .Z011, method_name);
+        // Build message with doc comment
+        const msg = std.fmt.allocPrint(self.allocator, "'{s}' is deprecated: {s}", .{ method_name, doc }) catch return;
+        self.allocated_contexts.append(self.allocator, msg) catch {
+            self.allocator.free(msg);
+            return;
+        };
+        self.report(loc, .Z011, msg);
     }
 }
 
