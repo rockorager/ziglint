@@ -154,6 +154,14 @@ pub fn init(allocator: std.mem.Allocator, graph: *const ModuleGraph) TypeResolve
     };
 }
 
+pub const MethodDef = struct {
+    module_path: []const u8,
+    node: Ast.Node.Index,
+    name_token: Ast.TokenIndex,
+    line: u32,
+    column: u32,
+};
+
 pub fn deinit(self: *TypeResolver) void {
     _ = self;
 }
@@ -162,6 +170,100 @@ pub fn deinit(self: *TypeResolver) void {
 pub fn typeOf(self: *TypeResolver, module_path: []const u8, node: Ast.Node.Index) TypeInfo {
     const mod = self.graph.getModule(module_path) orelse return .unknown;
     return self.resolveNodeType(&mod.tree, node, module_path);
+}
+
+/// Finds a method definition given a receiver type and method name.
+/// For user_type, looks up the method in the type's module.
+/// Returns null for std_type (no access to stdlib source) or if not found.
+pub fn findMethodDef(self: *TypeResolver, receiver_type: TypeInfo, method_name: []const u8) ?MethodDef {
+    switch (receiver_type) {
+        .user_type => |u| {
+            return self.findMethodInModule(u.module_path, u.name, method_name);
+        },
+        else => return null,
+    }
+}
+
+fn findMethodInModule(self: *TypeResolver, module_path: []const u8, type_name: []const u8, method_name: []const u8) ?MethodDef {
+    const mod = self.graph.getModule(module_path) orelse return null;
+    const tree = &mod.tree;
+
+    const type_node = self.findTypeDecl(tree, type_name) orelse return null;
+
+    return self.findMethodInType(tree, type_node, method_name, module_path);
+}
+
+fn findTypeDecl(self: *TypeResolver, tree: *const Ast, type_name: []const u8) ?Ast.Node.Index {
+    _ = self;
+
+    for (tree.rootDecls()) |decl_node| {
+        const decl_tag = tree.nodeTag(decl_node);
+        switch (decl_tag) {
+            .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => {
+                const var_decl = tree.fullVarDecl(decl_node) orelse continue;
+                const name_token = var_decl.ast.mut_token + 1;
+                const decl_name = tree.tokenSlice(name_token);
+                if (std.mem.eql(u8, decl_name, type_name)) {
+                    const init_node = var_decl.ast.init_node.unwrap() orelse continue;
+                    return init_node;
+                }
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn findMethodInType(self: *TypeResolver, tree: *const Ast, type_node: Ast.Node.Index, method_name: []const u8, module_path: []const u8) ?MethodDef {
+    _ = self;
+
+    const tag = tree.nodeTag(type_node);
+
+    var members_buf: [2]Ast.Node.Index = undefined;
+    const members: []const Ast.Node.Index = switch (tag) {
+        .container_decl, .container_decl_trailing => blk: {
+            const data = tree.nodeData(type_node).extra_range;
+            const start: usize = @intFromEnum(data.start);
+            const end: usize = @intFromEnum(data.end);
+            break :blk @ptrCast(tree.extra_data[start..end]);
+        },
+        .container_decl_two, .container_decl_two_trailing => blk: {
+            const data = tree.nodeData(type_node).opt_node_and_opt_node;
+            var len: usize = 0;
+            if (data[0].unwrap()) |n| {
+                members_buf[len] = n;
+                len += 1;
+            }
+            if (data[1].unwrap()) |n| {
+                members_buf[len] = n;
+                len += 1;
+            }
+            break :blk members_buf[0..len];
+        },
+        else => return null,
+    };
+
+    for (members) |member| {
+        const member_tag = tree.nodeTag(member);
+        if (member_tag == .fn_decl) {
+            var buf: [1]Ast.Node.Index = undefined;
+            const fn_proto = tree.fullFnProto(&buf, member) orelse continue;
+            const fn_name_token = fn_proto.name_token orelse continue;
+            const fn_name = tree.tokenSlice(fn_name_token);
+            if (std.mem.eql(u8, fn_name, method_name)) {
+                const loc = tree.tokenLocation(0, fn_name_token);
+                return .{
+                    .module_path = module_path,
+                    .node = member,
+                    .name_token = fn_name_token,
+                    .line = @intCast(loc.line),
+                    .column = @intCast(loc.column),
+                };
+            }
+        }
+    }
+
+    return null;
 }
 
 fn resolveNodeType(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Index, module_path: []const u8) TypeInfo {
@@ -645,4 +747,80 @@ test "resolve function declaration" {
     const root_decls = tree.rootDecls();
     const type_info = resolver.typeOf(path, root_decls[0]);
     try std.testing.expect(type_info == .function);
+}
+
+test "find method in user type" {
+    const source =
+        \\const MyType = struct {
+        \\    value: u32,
+        \\    pub fn getValue(self: *@This()) u32 {
+        \\        return self.value;
+        \\    }
+        \\};
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    const user_type: TypeInfo = .{ .user_type = .{ .module_path = path, .name = "MyType" } };
+    const method_def = resolver.findMethodDef(user_type, "getValue");
+
+    try std.testing.expect(method_def != null);
+    try std.testing.expectEqual(@as(u32, 2), method_def.?.line);
+}
+
+test "find method not found returns null" {
+    const source =
+        \\const MyType = struct {
+        \\    value: u32,
+        \\};
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    const user_type: TypeInfo = .{ .user_type = .{ .module_path = path, .name = "MyType" } };
+    const method_def = resolver.findMethodDef(user_type, "nonexistent");
+
+    try std.testing.expect(method_def == null);
+}
+
+test "find method in std_type returns null" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = "const x = 1;" });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    const std_type: TypeInfo = .{ .std_type = .{ .path = "fs.File" } };
+    const method_def = resolver.findMethodDef(std_type, "read");
+
+    try std.testing.expect(method_def == null);
 }
