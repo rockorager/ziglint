@@ -36,4 +36,31 @@ pub fn build(b: *std.Build) void {
 
     const fmt_check = b.addFmt(.{ .paths = &.{ "src", "build.zig", "build.zig.zon" } });
     test_step.dependOn(&fmt_check.step);
+
+    const lint_step = addLint(b, exe, &.{ "src", "build.zig" });
+    test_step.dependOn(lint_step);
+}
+
+/// Add a ziglint step to your build. Use as a dependency to run linting.
+/// Example usage in a downstream project:
+/// ```zig
+/// const ziglint_dep = b.dependency("ziglint", .{});
+/// const lint_step = ziglint.addLint(b, ziglint_dep, &.{ "src", "build.zig" });
+/// b.step("lint", "Run ziglint").dependOn(lint_step);
+/// ```
+pub fn addLint(
+    b: *std.Build,
+    ziglint_dep: anytype,
+    paths: []const []const u8,
+) *std.Build.Step {
+    const exe = switch (@TypeOf(ziglint_dep)) {
+        *std.Build.Step.Compile => ziglint_dep,
+        *std.Build.Dependency => ziglint_dep.artifact("ziglint"),
+        else => @compileError("expected *Compile or *Dependency"),
+    };
+
+    const run = b.addRunArtifact(exe);
+    run.addArgs(paths);
+    run.expectExitCode(0);
+    return &run.step;
 }
