@@ -1,0 +1,10 @@
+.{
+    .name = .ziglint,
+    .version = "0.0.0",
+    .fingerprint = 0x4b7deecc2ff046b7,
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
