@@ -142,6 +142,8 @@ fn visitNode(self: *Linter, node: Ast.Node.Index) void {
     switch (tag) {
         .fn_decl => self.checkFnDecl(node),
         .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => self.checkVarDecl(node),
+        .@"return" => self.checkReturn(node),
+        .call_one, .call_one_comma, .call, .call_comma => self.checkCallArgs(node),
         else => {},
     }
 
@@ -247,6 +249,45 @@ fn checkDupeImport(self: *Linter, var_decl: Ast.full.VarDecl, name_token: Ast.To
         self.report(loc, .Z007, import_path);
     } else {
         self.seen_imports.put(self.allocator, import_path, name_token) catch {};
+    }
+}
+
+fn checkReturn(self: *Linter, node: Ast.Node.Index) void {
+    const return_expr = self.tree.nodeData(node).opt_node.unwrap() orelse return;
+    self.checkRedundantType(return_expr);
+}
+
+fn checkCallArgs(self: *Linter, node: Ast.Node.Index) void {
+    var buf: [1]Ast.Node.Index = undefined;
+    const call = self.tree.fullCall(&buf, node) orelse return;
+    for (call.ast.params) |arg| {
+        self.checkRedundantType(arg);
+    }
+}
+
+fn checkRedundantType(self: *Linter, node: Ast.Node.Index) void {
+    const tag = self.tree.nodeTag(node);
+
+    if (isExplicitStructInit(tag)) {
+        var buf: [2]Ast.Node.Index = undefined;
+        const struct_init = self.tree.fullStructInit(&buf, node) orelse return;
+        const type_node = struct_init.ast.type_expr.unwrap() orelse return;
+        const type_token = self.tree.nodeMainToken(type_node);
+        const type_name = self.tree.tokenSlice(type_token);
+        const loc = self.tree.tokenLocation(0, type_token);
+        self.report(loc, .Z010, type_name);
+    } else if (tag == .field_access) {
+        // Only flag if the LHS is a PascalCase identifier (likely a type/enum)
+        const data = self.tree.nodeData(node).node_and_token;
+        const lhs = data[0];
+        if (self.tree.nodeTag(lhs) != .identifier) return;
+        const lhs_name = self.tree.tokenSlice(self.tree.nodeMainToken(lhs));
+        if (!isPascalCase(lhs_name)) return;
+
+        const field_token = data[1];
+        const field_name = self.tree.tokenSlice(field_token);
+        const loc = self.tree.tokenLocation(0, self.tree.nodeMainToken(lhs));
+        self.report(loc, .Z010, field_name);
     }
 }
 
@@ -797,4 +838,58 @@ test "Z009: file without top-level fields can be lowercase" {
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(0, linter.diagnostics.items.len);
+}
+
+test "Z010: detect explicit struct in return" {
+    var linter: Linter = .init(std.testing.allocator, "fn foo() Foo { return Foo{}; }", "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnostics.items.len);
+    try std.testing.expectEqual(rules.Rule.Z010, linter.diagnostics.items[0].rule);
+}
+
+test "Z010: allow anonymous struct in return" {
+    var linter: Linter = .init(std.testing.allocator, "fn foo() Foo { return .{}; }", "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnostics.items.len);
+}
+
+test "Z010: detect explicit struct in function arg" {
+    var linter: Linter = .init(std.testing.allocator, "fn bar(x: Foo) void {} fn foo() void { bar(Foo{}); }", "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnostics.items.len);
+    try std.testing.expectEqual(rules.Rule.Z010, linter.diagnostics.items[0].rule);
+}
+
+test "Z010: allow anonymous struct in function arg" {
+    var linter: Linter = .init(std.testing.allocator, "fn bar(x: Foo) void {} fn foo() void { bar(.{}); }", "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnostics.items.len);
+}
+
+test "Z010: detect explicit enum in return" {
+    var linter: Linter = .init(std.testing.allocator, "fn foo() Mode { return Mode.fast; }", "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnostics.items.len);
+    try std.testing.expectEqual(rules.Rule.Z010, linter.diagnostics.items[0].rule);
+}
+
+test "Z010: allow anonymous enum in return" {
+    var linter: Linter = .init(std.testing.allocator, "fn foo() Mode { return .fast; }", "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnostics.items.len);
+}
+
+test "Z010: allow field access on non-type (self.field)" {
+    var linter: Linter = .init(std.testing.allocator, "fn foo(self: *Self) u32 { return self.value; }", "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z010);
+    }
 }
