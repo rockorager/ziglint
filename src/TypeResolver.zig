@@ -174,14 +174,124 @@ pub fn typeOf(self: *TypeResolver, module_path: []const u8, node: Ast.Node.Index
 
 /// Finds a method definition given a receiver type and method name.
 /// For user_type, looks up the method in the type's module.
-/// Returns null for std_type (no access to stdlib source) or if not found.
+/// For std_type, resolves the path through stdlib imports to find the type.
 pub fn findMethodDef(self: *TypeResolver, receiver_type: TypeInfo, method_name: []const u8) ?MethodDef {
     switch (receiver_type) {
         .user_type => |u| {
             return self.findMethodInModule(u.module_path, u.name, method_name);
         },
+        .std_type => |s| {
+            return self.findMethodInStdlib(s.path, method_name);
+        },
         else => return null,
     }
+}
+
+/// Resolves a stdlib path like "fs.File" to find the method.
+/// Follows the import chain: std.zig -> fs.zig -> File type -> method
+fn findMethodInStdlib(self: *TypeResolver, path: []const u8, method_name: []const u8) ?MethodDef {
+    const lib_path = self.graph.zig_lib_path orelse return null;
+
+    // Start at std.zig (lib_dir/std/std.zig)
+    const std_path = std.fs.path.join(self.allocator, &.{ lib_path, "std", "std.zig" }) catch return null;
+    defer self.allocator.free(std_path);
+
+    // Split path into components (e.g., "fs.File" -> ["fs", "File"])
+    var components = std.mem.splitScalar(u8, path, '.');
+    var current_module_path: []const u8 = std_path;
+    var owns_path = false;
+    defer if (owns_path) self.allocator.free(current_module_path);
+
+    var type_name: ?[]const u8 = null;
+
+    while (components.next()) |component| {
+        const mod = self.graph.getModule(current_module_path) orelse return null;
+        const tree = &mod.tree;
+
+        // Look for this component as a declaration
+        if (self.findDeclInModule(tree, component, current_module_path)) |result| {
+            switch (result) {
+                .import_path => |imported| {
+                    // It's an import, follow it
+                    if (owns_path) self.allocator.free(current_module_path);
+                    current_module_path = imported;
+                    owns_path = true;
+                },
+                .type_node => {
+                    // It's a type declaration, this should be the last component
+                    type_name = component;
+                    break;
+                },
+            }
+        } else {
+            return null;
+        }
+    }
+
+    // If we have a type name, look for the method in that type
+    if (type_name) |tn| {
+        return self.findMethodInModule(current_module_path, tn, method_name);
+    }
+
+    // No explicit type - the module itself might be a file-as-struct (like fs/File.zig)
+    return self.findMethodInFileAsStruct(current_module_path, method_name);
+}
+
+const DeclResult = union(enum) {
+    import_path: []const u8,
+    type_node: Ast.Node.Index,
+};
+
+/// Finds a declaration in a module and returns either an import path or type node.
+fn findDeclInModule(self: *TypeResolver, tree: *const Ast, name: []const u8, module_path: []const u8) ?DeclResult {
+    for (tree.rootDecls()) |decl_node| {
+        const decl_tag = tree.nodeTag(decl_node);
+        switch (decl_tag) {
+            .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => {
+                const var_decl = tree.fullVarDecl(decl_node) orelse continue;
+                const name_token = var_decl.ast.mut_token + 1;
+                const decl_name = tree.tokenSlice(name_token);
+                if (!std.mem.eql(u8, decl_name, name)) continue;
+
+                const init_node = var_decl.ast.init_node.unwrap() orelse continue;
+                const init_tag = tree.nodeTag(init_node);
+
+                // Check if it's an @import
+                if (init_tag == .builtin_call_two or init_tag == .builtin_call_two_comma) {
+                    const main_token = tree.nodeMainToken(init_node);
+                    const builtin_name = tree.tokenSlice(main_token);
+                    if (std.mem.eql(u8, builtin_name, "@import")) {
+                        var buf: [2]Ast.Node.Index = undefined;
+                        const params = tree.builtinCallParams(&buf, init_node) orelse continue;
+                        if (params.len == 0) continue;
+
+                        const arg_token = tree.nodeMainToken(params[0]);
+                        const raw_path = tree.tokenSlice(arg_token);
+                        if (raw_path.len < 2 or raw_path[0] != '"') continue;
+
+                        const import_str = raw_path[1 .. raw_path.len - 1];
+                        if (std.mem.endsWith(u8, import_str, ".zig")) {
+                            const module_dir = std.fs.path.dirname(module_path) orelse ".";
+                            const resolved = std.fs.path.join(self.allocator, &.{ module_dir, import_str }) catch continue;
+                            const canonical = std.fs.cwd().realpathAlloc(self.allocator, resolved) catch {
+                                self.allocator.free(resolved);
+                                continue;
+                            };
+                            self.allocator.free(resolved);
+                            return .{ .import_path = canonical };
+                        }
+                    }
+                }
+
+                // It's a type declaration
+                if (isContainerDecl(init_tag)) {
+                    return .{ .type_node = init_node };
+                }
+            },
+            else => {},
+        }
+    }
+    return null;
 }
 
 fn findMethodInModule(self: *TypeResolver, module_path: []const u8, type_name: []const u8, method_name: []const u8) ?MethodDef {
@@ -191,6 +301,33 @@ fn findMethodInModule(self: *TypeResolver, module_path: []const u8, type_name: [
     const type_node = self.findTypeDecl(tree, type_name) orelse return null;
 
     return self.findMethodInType(tree, type_node, method_name, module_path);
+}
+
+/// For file-as-struct modules (like fs/File.zig), look for methods in root declarations.
+fn findMethodInFileAsStruct(self: *TypeResolver, module_path: []const u8, method_name: []const u8) ?MethodDef {
+    const mod = self.graph.getModule(module_path) orelse return null;
+    const tree = &mod.tree;
+
+    for (tree.rootDecls()) |decl| {
+        const tag = tree.nodeTag(decl);
+        if (tag == .fn_decl) {
+            var buf: [1]Ast.Node.Index = undefined;
+            const fn_proto = tree.fullFnProto(&buf, decl) orelse continue;
+            const fn_name_token = fn_proto.name_token orelse continue;
+            const fn_name = tree.tokenSlice(fn_name_token);
+            if (std.mem.eql(u8, fn_name, method_name)) {
+                const loc = tree.tokenLocation(0, fn_name_token);
+                return .{
+                    .module_path = mod.path,
+                    .node = decl,
+                    .name_token = fn_name_token,
+                    .line = @intCast(loc.line),
+                    .column = @intCast(loc.column),
+                };
+            }
+        }
+    }
+    return null;
 }
 
 fn findTypeDecl(self: *TypeResolver, tree: *const Ast, type_name: []const u8) ?Ast.Node.Index {
@@ -445,13 +582,20 @@ fn resolveFieldAccess(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Inde
 
     switch (lhs_type) {
         .std_type => |s| {
+            // Build the full path: "fs" + "." + "File" = "fs.File"
             if (s.path.len == 0) {
                 return .{ .std_type = .{ .path = field_name } };
             }
-            return .{ .std_type = .{ .path = field_name } };
+            // Concatenate paths - we store these as slices into source, so we
+            // need to build a path string. For now, return the accumulated path
+            // by looking at the full field access chain.
+            const full_path = self.buildStdTypePath(tree, node);
+            return .{ .std_type = .{ .path = full_path } };
         },
         .user_type => {
-            return .{ .std_type = .{ .path = field_name } };
+            // Accessing a field on a user type - could be a nested type
+            const full_path = self.buildStdTypePath(tree, node);
+            return .{ .std_type = .{ .path = full_path } };
         },
         .unknown => {
             const lhs_tag = tree.nodeTag(lhs_node);
@@ -466,6 +610,88 @@ fn resolveFieldAccess(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Inde
     }
 
     return .unknown;
+}
+
+/// Builds the full path for a std type by walking up the field access chain.
+/// For `std.fs.File`, returns "fs.File".
+fn buildStdTypePath(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Index) []const u8 {
+    _ = self;
+    var parts: [16][]const u8 = undefined;
+    var count: usize = 0;
+
+    var current = node;
+    while (count < 16) {
+        const tag = tree.nodeTag(current);
+        if (tag != .field_access) break;
+
+        const data = tree.nodeData(current).node_and_token;
+        const field_token = data[1];
+        parts[count] = tree.tokenSlice(field_token);
+        count += 1;
+        current = data[0];
+    }
+
+    if (count == 0) return "";
+
+    // Check if root is "std"
+    const root_tag = tree.nodeTag(current);
+    if (root_tag == .identifier) {
+        const root_name = tree.tokenSlice(tree.nodeMainToken(current));
+        if (!std.mem.eql(u8, root_name, "std")) {
+            return "";
+        }
+    }
+
+    // Reverse and join - parts are in reverse order
+    // For simplicity, just return the last part which is the type name
+    // The full path is used for resolution
+    if (count >= 1) {
+        // Build path from parts in reverse order, skipping the type name at index 0
+        // e.g., for std.fs.File: parts = ["File", "fs"], we want "fs.File"
+        // For now, return the joined path from the source directly
+        // Since we can't easily allocate, we'll use a different approach:
+        // Return the full path by computing byte range in source
+        const first_token = tree.nodeMainToken(node);
+        const last_data = tree.nodeData(node).node_and_token;
+        _ = last_data;
+
+        // Find the start of the path after "std."
+        var start_node = node;
+        while (tree.nodeTag(start_node) == .field_access) {
+            const d = tree.nodeData(start_node).node_and_token;
+            const lhs = d[0];
+            if (tree.nodeTag(lhs) == .identifier) {
+                const lhs_name = tree.tokenSlice(tree.nodeMainToken(lhs));
+                if (std.mem.eql(u8, lhs_name, "std")) {
+                    break;
+                }
+            }
+            start_node = lhs;
+        }
+
+        // Get the token after "std."
+        if (tree.nodeTag(start_node) == .field_access) {
+            const start_data = tree.nodeData(start_node).node_and_token;
+            const start_field_token = start_data[1];
+            const end_field_token = first_token;
+            _ = end_field_token;
+
+            // Get byte positions
+            const start_loc = tree.tokenLocation(0, start_field_token);
+            const end_token_data = tree.nodeData(node).node_and_token;
+            const end_loc = tree.tokenLocation(0, end_token_data[1]);
+            const end_slice = tree.tokenSlice(end_token_data[1]);
+
+            const start_byte = start_loc.line_start + start_loc.column;
+            const end_byte = end_loc.line_start + end_loc.column + end_slice.len;
+
+            if (end_byte > start_byte and end_byte <= tree.source.len) {
+                return tree.source[start_byte..end_byte];
+            }
+        }
+    }
+
+    return parts[0];
 }
 
 fn resolveBuiltinCall(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Index, module_path: []const u8) TypeInfo {
@@ -731,6 +957,36 @@ test "resolve field access on std" {
     try std.testing.expectEqualStrings("fs", type_info.std_type.path);
 }
 
+test "resolve nested field access std.fs.File" {
+    const source =
+        \\const std = @import("std");
+        \\const File = std.fs.File;
+    ;
+
+    var tree = try Ast.parse(std.testing.allocator, source, .zig);
+    defer tree.deinit(std.testing.allocator);
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    const root_decls = tree.rootDecls();
+    try std.testing.expect(root_decls.len >= 2);
+
+    const type_info = resolver.typeOf(path, root_decls[1]);
+    try std.testing.expect(type_info == .std_type);
+    try std.testing.expectEqualStrings("fs.File", type_info.std_type.path);
+}
+
 test "resolve string literal" {
     const source = "const s = \"hello\";";
 
@@ -835,7 +1091,7 @@ test "find method not found returns null" {
     try std.testing.expect(method_def == null);
 }
 
-test "find method in std_type returns null" {
+test "find method in std_type without zig_lib_path returns null" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
@@ -843,6 +1099,7 @@ test "find method in std_type returns null" {
     const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
     defer std.testing.allocator.free(path);
 
+    // No zig_lib_path, so stdlib can't be resolved
     var graph = try ModuleGraph.init(std.testing.allocator, path, null);
     defer graph.deinit();
 

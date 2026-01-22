@@ -186,7 +186,7 @@ fn resolveImportPath(self: *ModuleGraph, import_str: []const u8, module_path: []
     // Handle "std" import
     if (std.mem.eql(u8, import_str, "std")) {
         const lib_path = self.zig_lib_path orelse return null;
-        return try std.fs.path.join(self.allocator, &.{ lib_path, "std.zig" });
+        return try std.fs.path.join(self.allocator, &.{ lib_path, "std", "std.zig" });
     }
 
     // Handle builtin (skip it)
