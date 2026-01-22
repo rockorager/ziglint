@@ -232,6 +232,31 @@ fn isTypeAlias(self: *Linter, var_decl: Ast.full.VarDecl) bool {
 }
 
 fn isIgnored(self: *Linter, line: usize, rule: rules.Rule) bool {
+    // Check inline comment on current line
+    if (self.lineHasIgnore(self.getLineText(line), rule)) return true;
+
+    // Check preceding comment-only lines (walk back through consecutive comments)
+    var check_line = line;
+    while (check_line > 0) {
+        check_line -= 1;
+        const prev_line = self.getLineText(check_line);
+        const trimmed = std.mem.trimLeft(u8, prev_line, " \t");
+        if (!std.mem.startsWith(u8, trimmed, "//")) break;
+        if (self.lineHasIgnore(prev_line, rule)) return true;
+    }
+
+    return false;
+}
+
+fn lineHasIgnore(_: *Linter, line_text: []const u8, rule: rules.Rule) bool {
+    if (std.mem.indexOf(u8, line_text, "// ziglint-ignore:")) |idx| {
+        const ignore_part = line_text[idx + 18 ..];
+        if (std.mem.indexOf(u8, ignore_part, rule.code()) != null) return true;
+    }
+    return false;
+}
+
+fn getLineText(self: *Linter, line: usize) []const u8 {
     const line_start = if (line == 0) 0 else blk: {
         var newlines: usize = 0;
         for (self.source, 0..) |c, i| {
@@ -247,14 +272,7 @@ fn isIgnored(self: *Linter, line: usize, rule: rules.Rule) bool {
         if (c == '\n') break i;
     } else self.source.len;
 
-    const line_text = self.source[line_start..line_end];
-
-    if (std.mem.indexOf(u8, line_text, "// ziglint-ignore:")) |idx| {
-        const ignore_part = line_text[idx + 18 ..];
-        if (std.mem.indexOf(u8, ignore_part, rule.code()) != null) return true;
-    }
-
-    return false;
+    return self.source[line_start..line_end];
 }
 
 fn report(self: *Linter, loc: Ast.Location, rule: rules.Rule, context: []const u8) void {
@@ -580,4 +598,49 @@ test "inline ignore: multiline - only affects that line" {
     linter.lint();
     try std.testing.expectEqual(1, linter.diagnostics.items.len);
     try std.testing.expectEqual(rules.Rule.Z001, linter.diagnostics.items[0].rule);
+}
+
+test "inline ignore: preceding line comment" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\// ziglint-ignore: Z001
+        \\fn MyFunc() void {}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnostics.items.len);
+}
+
+test "inline ignore: preceding line only affects next line" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\// ziglint-ignore: Z001
+        \\fn MyFunc() void {}
+        \\fn AnotherBad() void {}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnostics.items.len);
+    try std.testing.expectEqual(rules.Rule.Z001, linter.diagnostics.items[0].rule);
+}
+
+test "inline ignore: multiple preceding comment lines" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\// ziglint-ignore: Z001
+        \\// ziglint-ignore: Z006
+        \\fn MyFunc() void { const myVar = 1; _ = myVar; }
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnostics.items.len);
+}
+
+test "inline ignore: multiple preceding with other comments" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\// ziglint-ignore: Z001
+        \\// This function does something important
+        \\// ziglint-ignore: Z006
+        \\fn MyFunc() void { const myVar = 1; _ = myVar; }
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnostics.items.len);
 }
