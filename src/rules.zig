@@ -11,6 +11,7 @@ pub const Rule = enum(u16) {
     Z008 = 8,
     Z009 = 9,
     Z010 = 10,
+    Z011 = 11,
 
     pub fn code(self: Rule) []const u8 {
         return @tagName(self);
@@ -28,6 +29,7 @@ pub const Rule = enum(u16) {
             .Z008 => try writer.writeAll("comment divider line"),
             .Z009 => try writer.print("file '{s}' has top-level fields and should be PascalCase", .{context}),
             .Z010 => try writer.print("redundant type specifier; prefer '.{s}' over explicit type", .{context}),
+            .Z011 => try writer.print("call to deprecated function '{s}'", .{context}),
         }
     }
 };

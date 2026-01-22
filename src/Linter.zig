@@ -3,6 +3,8 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
 const rules = @import("rules.zig");
+const TypeResolver = @import("TypeResolver.zig");
+const doc_comments = @import("doc_comments.zig");
 
 const Linter = @This();
 
@@ -12,6 +14,8 @@ path: []const u8,
 tree: Ast,
 diagnostics: std.ArrayListUnmanaged(Diagnostic),
 seen_imports: std.StringHashMapUnmanaged(Ast.TokenIndex),
+type_resolver: ?*TypeResolver = null,
+module_path: ?[]const u8 = null,
 
 pub const Diagnostic = struct {
     path: []const u8,
@@ -40,6 +44,25 @@ pub fn init(allocator: std.mem.Allocator, source: [:0]const u8, path: []const u8
         .tree = Ast.parse(allocator, source, .zig) catch unreachable,
         .diagnostics = .empty,
         .seen_imports = .empty,
+    };
+}
+
+pub fn initWithSemantics(
+    allocator: std.mem.Allocator,
+    source: [:0]const u8,
+    path: []const u8,
+    type_resolver: *TypeResolver,
+    module_path: []const u8,
+) Linter {
+    return .{
+        .allocator = allocator,
+        .source = source,
+        .path = path,
+        .tree = Ast.parse(allocator, source, .zig) catch unreachable,
+        .diagnostics = .empty,
+        .seen_imports = .empty,
+        .type_resolver = type_resolver,
+        .module_path = module_path,
     };
 }
 
@@ -143,7 +166,10 @@ fn visitNode(self: *Linter, node: Ast.Node.Index) void {
         .fn_decl => self.checkFnDecl(node),
         .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => self.checkVarDecl(node),
         .@"return" => self.checkReturn(node),
-        .call_one, .call_one_comma, .call, .call_comma => self.checkCallArgs(node),
+        .call_one, .call_one_comma, .call, .call_comma => {
+            self.checkCallArgs(node);
+            self.checkDeprecatedCall(node);
+        },
         else => {},
     }
 
@@ -263,6 +289,44 @@ fn checkCallArgs(self: *Linter, node: Ast.Node.Index) void {
     for (call.ast.params) |arg| {
         self.checkRedundantType(arg);
     }
+}
+
+fn checkDeprecatedCall(self: *Linter, node: Ast.Node.Index) void {
+    const resolver = self.type_resolver orelse return;
+    const mod_path = self.module_path orelse return;
+
+    var buf: [1]Ast.Node.Index = undefined;
+    const call = self.tree.fullCall(&buf, node) orelse return;
+
+    const fn_expr = call.ast.fn_expr;
+    if (self.tree.nodeTag(fn_expr) != .field_access) return;
+
+    const data = self.tree.nodeData(fn_expr).node_and_token;
+    const receiver_node = data[0];
+    const method_token = data[1];
+    const method_name = self.tree.tokenSlice(method_token);
+
+    const receiver_type = resolver.typeOf(mod_path, receiver_node);
+
+    const method_def = resolver.findMethodDef(receiver_type, method_name) orelse return;
+
+    const mod = resolver.graph.getModule(method_def.module_path) orelse return;
+    const doc = doc_comments.getDocComment(self.allocator, &mod.tree, method_def.node) orelse return;
+    defer self.allocator.free(doc);
+
+    if (containsDeprecated(doc)) {
+        const loc = self.tree.tokenLocation(0, method_token);
+        self.report(loc, .Z011, method_name);
+    }
+}
+
+fn containsDeprecated(text: []const u8) bool {
+    var i: usize = 0;
+    while (i + 10 <= text.len) : (i += 1) {
+        const slice = text[i .. i + 10];
+        if (std.ascii.eqlIgnoreCase(slice, "deprecated")) return true;
+    }
+    return false;
 }
 
 fn checkRedundantType(self: *Linter, node: Ast.Node.Index) void {
@@ -892,4 +956,116 @@ test "Z010: allow field access on non-type (self.field)" {
     for (linter.diagnostics.items) |d| {
         try std.testing.expect(d.rule != rules.Rule.Z010);
     }
+}
+
+test "Z011: detect deprecated method call" {
+    const ModuleGraph = @import("ModuleGraph.zig");
+    const source =
+        \\const MyType = struct {
+        \\    value: u32 = 0,
+        \\    /// Deprecated: use newMethod instead
+        \\    pub fn oldMethod(self: *@This()) void {
+        \\        _ = self;
+        \\    }
+        \\};
+        \\const instance: MyType = .{};
+        \\pub fn main() void {
+        \\    instance.oldMethod();
+        \\}
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    var linter: Linter = .initWithSemantics(std.testing.allocator, source, path, &resolver, path);
+    defer linter.deinit();
+
+    linter.lint();
+
+    var found_z011 = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z011) {
+            found_z011 = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_z011);
+}
+
+test "Z011: no warning for non-deprecated method" {
+    const ModuleGraph = @import("ModuleGraph.zig");
+    const source =
+        \\const MyType = struct {
+        \\    value: u32,
+        \\    /// Does something useful
+        \\    pub fn goodMethod(self: *@This()) void {
+        \\        _ = self;
+        \\    }
+        \\};
+        \\pub fn main() void {
+        \\    var x: MyType = .{ .value = 0 };
+        \\    x.goodMethod();
+        \\}
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    var linter: Linter = .initWithSemantics(std.testing.allocator, source, path, &resolver, path);
+    defer linter.deinit();
+
+    linter.lint();
+
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z011);
+    }
+}
+
+test "Z011: without semantic context, no Z011 warnings" {
+    const source =
+        \\const MyType = struct {
+        \\    /// Deprecated
+        \\    pub fn oldMethod(self: *@This()) void { _ = self; }
+        \\};
+        \\pub fn main() void {
+        \\    var x: MyType = .{};
+        \\    x.oldMethod();
+        \\}
+    ;
+
+    var linter: Linter = .init(std.testing.allocator, source, "test.zig");
+    defer linter.deinit();
+    linter.lint();
+
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z011);
+    }
+}
+
+test "containsDeprecated" {
+    try std.testing.expect(containsDeprecated("Deprecated: use X instead"));
+    try std.testing.expect(containsDeprecated("deprecated function"));
+    try std.testing.expect(containsDeprecated("This is DEPRECATED"));
+    try std.testing.expect(!containsDeprecated("This function is useful"));
+    try std.testing.expect(!containsDeprecated("deprecat")); // too short
 }

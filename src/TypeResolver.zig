@@ -356,7 +356,7 @@ fn findDeclarationInModule(self: *TypeResolver, tree: *const Ast, name: []const 
                 const name_token = var_decl.ast.mut_token + 1;
                 const decl_name = tree.tokenSlice(name_token);
                 if (std.mem.eql(u8, decl_name, name)) {
-                    return self.resolveVarDecl(tree, decl_node, module_path);
+                    return self.resolveVarDeclWithName(tree, decl_node, module_path, decl_name);
                 }
             },
             .fn_decl => {
@@ -376,16 +376,46 @@ fn findDeclarationInModule(self: *TypeResolver, tree: *const Ast, name: []const 
 
 fn resolveVarDecl(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Index, module_path: []const u8) TypeInfo {
     const var_decl = tree.fullVarDecl(node) orelse return .unknown;
+    const name_token = var_decl.ast.mut_token + 1;
+    const name = tree.tokenSlice(name_token);
+    return self.resolveVarDeclWithName(tree, node, module_path, name);
+}
+
+fn resolveVarDeclWithName(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Index, module_path: []const u8, decl_name: []const u8) TypeInfo {
+    const var_decl = tree.fullVarDecl(node) orelse return .unknown;
 
     if (var_decl.ast.type_node.unwrap()) |type_node| {
         return self.resolveNodeType(tree, type_node, module_path);
     }
 
     if (var_decl.ast.init_node.unwrap()) |init_node| {
+        const init_tag = tree.nodeTag(init_node);
+        if (isContainerDecl(init_tag)) {
+            return .{ .user_type = .{ .module_path = module_path, .name = decl_name } };
+        }
         return self.resolveNodeType(tree, init_node, module_path);
     }
 
     return .unknown;
+}
+
+fn isContainerDecl(tag: Ast.Node.Tag) bool {
+    return switch (tag) {
+        .container_decl,
+        .container_decl_trailing,
+        .container_decl_two,
+        .container_decl_two_trailing,
+        .container_decl_arg,
+        .container_decl_arg_trailing,
+        .tagged_union,
+        .tagged_union_trailing,
+        .tagged_union_two,
+        .tagged_union_two_trailing,
+        .tagged_union_enum_tag,
+        .tagged_union_enum_tag_trailing,
+        => true,
+        else => false,
+    };
 }
 
 fn resolveFnDecl(_: *TypeResolver, tree: *const Ast, node: Ast.Node.Index, _: []const u8) TypeInfo {
