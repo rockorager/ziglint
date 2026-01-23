@@ -47,6 +47,10 @@ pub fn deinit(self: *ModuleGraph) void {
     self.modules.deinit(self.allocator);
 }
 
+pub fn addModulePublic(self: *ModuleGraph, path: []const u8) void {
+    self.addModule(path) catch {};
+}
+
 fn addModule(self: *ModuleGraph, path: []const u8) !void {
     const canonical = try std.fs.cwd().realpathAlloc(self.allocator, path);
 

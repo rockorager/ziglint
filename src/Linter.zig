@@ -35,14 +35,38 @@ pub const Diagnostic = struct {
     rule: rules.Rule,
     context: []const u8 = "",
 
-    pub fn write(self: Diagnostic, writer: *std.Io.Writer) !void {
-        try writer.print("{s}: {s}:{}:{}: ", .{
-            self.rule.code(),
-            self.path,
-            self.line,
-            self.column,
-        });
-        try self.rule.writeMessage(writer, self.context);
+    // ANSI escape codes
+    const dim = "\x1b[2m";
+    const cyan = "\x1b[36m";
+    const yellow = "\x1b[33m";
+    const reset = "\x1b[0m";
+
+    pub fn write(self: Diagnostic, writer: *std.Io.Writer, use_color: bool, display_path: []const u8) !void {
+        if (use_color) {
+            try writer.print("{s}{s}{s}{s}:{s} {s}{s}{s}:{s}{s}{}{s}{s}:{s} ", .{
+                yellow,
+                self.rule.code(),
+                reset,
+                dim,
+                reset,
+                dim,
+                display_path,
+                reset,
+                dim,
+                cyan,
+                self.line,
+                reset,
+                dim,
+                reset,
+            });
+        } else {
+            try writer.print("{s}: {s}:{}: ", .{
+                self.rule.code(),
+                display_path,
+                self.line,
+            });
+        }
+        try self.rule.writeMessage(writer, self.context, use_color);
         try writer.writeByte('\n');
     }
 };
@@ -293,8 +317,13 @@ fn isPublicDecl(self: *Linter, node: Ast.Node.Index) bool {
 
 fn isTypeDecl(self: *Linter, var_decl: Ast.full.VarDecl) bool {
     const init_node = var_decl.ast.init_node.unwrap() orelse return false;
-    const tag = self.tree.nodeTag(init_node);
+    return self.isTypeExpression(init_node);
+}
+
+fn isTypeExpression(self: *Linter, node: Ast.Node.Index) bool {
+    const tag = self.tree.nodeTag(node);
     return switch (tag) {
+        // Container types (struct, enum, union)
         .container_decl,
         .container_decl_trailing,
         .container_decl_two,
@@ -308,9 +337,51 @@ fn isTypeDecl(self: *Linter, var_decl: Ast.full.VarDecl) bool {
         .tagged_union_enum_tag,
         .tagged_union_enum_tag_trailing,
         => true,
+        // Pointer types (e.g., *anyopaque, *T)
+        .ptr_type_aligned,
+        .ptr_type_sentinel,
+        .ptr_type,
+        .ptr_type_bit_range,
+        => true,
+        // Optional types (e.g., ?T)
+        .optional_type => true,
+        // Array types (e.g., [N]T)
+        .array_type,
+        .array_type_sentinel,
+        => true,
+        // Error union types (e.g., E!T)
+        .error_union => true,
+        // Error set declarations (e.g., error{A, B})
+        .error_set_decl => true,
+        // Function types
+        .fn_proto,
+        .fn_proto_multi,
+        .fn_proto_one,
+        .fn_proto_simple,
+        => true,
+        // Builtin type constructors
         .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => blk: {
-            const token = self.tree.tokenSlice(self.tree.nodeMainToken(init_node));
+            const token = self.tree.tokenSlice(self.tree.nodeMainToken(node));
             break :blk std.mem.eql(u8, token, "@Type");
+        },
+        // Identifier referencing another type (type alias)
+        .identifier => blk: {
+            const name = self.tree.tokenSlice(self.tree.nodeMainToken(node));
+            break :blk isPascalCase(name) or isBuiltinType(name);
+        },
+        // Labeled blocks (comptime type construction, e.g., `key: { break :key @Type(...); }`)
+        .block_two, .block_two_semicolon, .block, .block_semicolon => true,
+        // Switch expressions (comptime type selection, e.g., `switch (os) { .linux => T1, else => T2 }`)
+        .@"switch", .switch_comma => true,
+        // If expressions (comptime type selection)
+        .@"if", .if_simple => true,
+        // Generic type instantiation (e.g., ArrayList(T), HashMap(K, V))
+        .call_one, .call_one_comma, .call, .call_comma => true,
+        // Field access (e.g., std.AutoHashMapUnmanaged)
+        .field_access => blk: {
+            const data = self.tree.nodeData(node).node_and_token;
+            const field_name = self.tree.tokenSlice(data[1]);
+            break :blk isPascalCase(field_name);
         },
         else => false,
     };
@@ -656,9 +727,21 @@ fn checkRedundantType(self: *Linter, node: Ast.Node.Index, check_field_access: b
         const struct_init = self.tree.fullStructInit(&buf, node) orelse return;
         const type_node = struct_init.ast.type_expr.unwrap() orelse return;
         const type_token = self.tree.nodeMainToken(type_node);
-        const type_name = self.tree.tokenSlice(type_token);
         const loc = self.tree.tokenLocation(0, type_token);
-        self.report(loc, .Z010, type_name);
+        // Get the fields part (everything after the type name)
+        const full_expr = self.getNodeSource(node);
+        const type_name = self.tree.tokenSlice(type_token);
+        // Find where the type name ends and extract the { ... } part
+        const brace_start = std.mem.indexOf(u8, full_expr, "{") orelse return;
+        const fields_part = truncateExpr(full_expr[brace_start..]);
+        const full_truncated = truncateExpr(full_expr);
+        const msg = std.fmt.allocPrint(self.allocator, ".{s}\x00{s}", .{ fields_part, full_truncated }) catch return;
+        self.allocated_contexts.append(self.allocator, msg) catch {
+            self.allocator.free(msg);
+            return;
+        };
+        _ = type_name;
+        self.report(loc, .Z010, msg);
     } else if (check_field_access and tag == .field_access) {
         // Only flag if the LHS is a PascalCase identifier (likely a type/enum)
         const data = self.tree.nodeData(node).node_and_token;
@@ -667,11 +750,45 @@ fn checkRedundantType(self: *Linter, node: Ast.Node.Index, check_field_access: b
         const lhs_name = self.tree.tokenSlice(self.tree.nodeMainToken(lhs));
         if (!isPascalCase(lhs_name)) return;
 
+        // Skip error sets - explicit Error.X is often preferred for clarity
+        if (self.type_resolver) |resolver| {
+            if (self.module_path) |mod_path| {
+                const lhs_type = resolver.typeOf(mod_path, lhs);
+                if (lhs_type == .error_set) return;
+            }
+        }
+
         const field_token = data[1];
         const field_name = self.tree.tokenSlice(field_token);
         const loc = self.tree.tokenLocation(0, self.tree.nodeMainToken(lhs));
-        self.report(loc, .Z010, field_name);
+        // Full expression is "Type.field"
+        const full_expr = truncateExpr(self.getNodeSource(node));
+        const msg = std.fmt.allocPrint(self.allocator, ".{s}\x00{s}", .{ field_name, full_expr }) catch return;
+        self.allocated_contexts.append(self.allocator, msg) catch {
+            self.allocator.free(msg);
+            return;
+        };
+        self.report(loc, .Z010, msg);
     }
+}
+
+fn getNodeSource(self: *Linter, node: Ast.Node.Index) []const u8 {
+    const token_starts = self.tree.tokens.items(.start);
+    const first_token = self.tree.firstToken(node);
+    const last_token = self.tree.lastToken(node);
+    const start = token_starts[first_token];
+    const end = token_starts[last_token] + self.tree.tokenSlice(last_token).len;
+    return self.source[start..end];
+}
+
+fn truncateExpr(expr: []const u8) []const u8 {
+    const max_len = 32;
+    if (expr.len <= max_len) return expr;
+    // Find a good break point (after opening brace if present)
+    if (std.mem.indexOf(u8, expr[0..@min(max_len, expr.len)], "{")) |brace| {
+        return expr[0 .. brace + 1];
+    }
+    return expr[0..max_len];
 }
 
 fn isExplicitStructInit(tag: Ast.Node.Tag) bool {
@@ -1545,6 +1662,92 @@ test "Z012: non-pub fn returning private type is ok" {
 test "Z012: generic parameter with comptime T: type is ok" {
     var linter: Linter = .init(std.testing.allocator,
         \\pub fn genericFn(comptime T: type) T { return undefined; }
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z012);
+    }
+}
+
+test "Z012: pub fn returning public pointer type alias is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\pub const Queue = *anyopaque;
+        \\pub fn getMain() Queue { return undefined; }
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z012);
+    }
+}
+
+test "Z012: pub fn returning public comptime block type is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\pub const Key = key: { break :key u32; };
+        \\pub fn getKey() Key { return 0; }
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z012);
+    }
+}
+
+test "Z012: pub fn returning public switch type alias is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\pub const MyType = switch (true) { true => u32, false => i32 };
+        \\pub fn getValue() MyType { return 0; }
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z012);
+    }
+}
+
+test "Z012: pub fn returning public generic type instantiation is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\pub const MyList = std.ArrayList(u32);
+        \\pub fn getList() MyList { return undefined; }
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z012);
+    }
+}
+
+test "Z012: pub fn returning public field access type alias is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\pub const Allocator = std.mem.Allocator;
+        \\pub fn getAllocator() Allocator { return undefined; }
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z012);
+    }
+}
+
+test "Z012: pub fn returning public error set is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\pub const MyError = error{ OutOfMemory, InvalidInput };
+        \\pub fn toInt(err: MyError) u32 { _ = err; return 0; }
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z012);
+    }
+}
+
+test "Z012: pub fn returning public if expression type is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\pub const MyType = if (true) u32 else i32;
+        \\pub fn getValue() MyType { return 0; }
     , "test.zig");
     defer linter.deinit();
     linter.lint();

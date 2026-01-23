@@ -5,9 +5,12 @@ const Linter = @import("Linter.zig");
 const ModuleGraph = @import("ModuleGraph.zig");
 const TypeResolver = @import("TypeResolver.zig");
 
+const rules = @import("rules.zig");
+
 pub const Config = struct {
     zig_lib_path: ?[]const u8 = null,
     paths: []const []const u8 = &.{},
+    ignored_rules: []const rules.Rule = &.{},
 };
 
 pub fn main() !u8 {
@@ -15,8 +18,11 @@ pub fn main() !u8 {
     defer arena.deinit();
     const allocator = arena.allocator();
 
+    const stdout_file = std.fs.File.stdout();
+    const use_color = detectColorSupport(stdout_file);
+
     var stdout_buf: [4096]u8 = undefined;
-    var stdout = std.fs.File.stdout().writer(&stdout_buf);
+    var stdout = stdout_file.writer(&stdout_buf);
     defer stdout.end() catch {};
 
     const config = parseArgs(allocator, &stdout.interface) catch |err| switch (err) {
@@ -33,10 +39,52 @@ pub fn main() !u8 {
 
     var total_issues: usize = 0;
     for (config.paths) |path| {
-        total_issues += try lintPath(allocator, path, zig_lib_path, &stdout.interface);
+        const abs_path = std.fs.cwd().realpathAlloc(allocator, path) catch path;
+        const project_root = findProjectRoot(abs_path);
+        total_issues += try lintPath(allocator, path, zig_lib_path, config.ignored_rules, use_color, project_root, &stdout.interface);
     }
 
     return if (total_issues > 0) 1 else 0;
+}
+
+fn detectColorSupport(file: std.fs.File) bool {
+    // NO_COLOR takes precedence (https://no-color.org/)
+    if (std.posix.getenv("NO_COLOR")) |_| return false;
+    // FORCE_COLOR forces color on even if not a TTY
+    if (std.posix.getenv("FORCE_COLOR")) |_| return true;
+    // Otherwise, use color if stdout is a TTY
+    return file.isTty();
+}
+
+fn findProjectRoot(start_path: []const u8) ?[]const u8 {
+    var path = start_path;
+    while (true) {
+        // Check if build.zig exists in this directory
+        const build_zig = std.fs.path.join(std.heap.page_allocator, &.{ path, "build.zig" }) catch return null;
+        defer std.heap.page_allocator.free(build_zig);
+
+        if (std.fs.cwd().access(build_zig, .{})) |_| {
+            return std.heap.page_allocator.dupe(u8, path) catch null;
+        } else |_| {}
+
+        // Move up one directory
+        const parent = std.fs.path.dirname(path) orelse return null;
+        if (std.mem.eql(u8, parent, path)) return null; // at root
+        path = parent;
+    }
+}
+
+fn makeRelativePath(path: []const u8, project_root: ?[]const u8) []const u8 {
+    const root = project_root orelse return path;
+    if (std.mem.startsWith(u8, path, root)) {
+        var rel = path[root.len..];
+        // Skip leading path separator
+        if (rel.len > 0 and rel[0] == std.fs.path.sep) {
+            rel = rel[1..];
+        }
+        if (rel.len > 0) return rel;
+    }
+    return path;
 }
 
 fn parseArgs(allocator: std.mem.Allocator, writer: *std.Io.Writer) !Config {
@@ -44,6 +92,7 @@ fn parseArgs(allocator: std.mem.Allocator, writer: *std.Io.Writer) !Config {
 
     var config: Config = .{};
     var paths: std.ArrayListUnmanaged([]const u8) = .empty;
+    var ignored_rules: std.ArrayListUnmanaged(rules.Rule) = .empty;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -55,6 +104,18 @@ fn parseArgs(allocator: std.mem.Allocator, writer: *std.Io.Writer) !Config {
                 return error.InvalidArgs;
             }
             config.zig_lib_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--ignore")) {
+            i += 1;
+            if (i >= args.len) {
+                try writer.writeAll("error: --ignore requires a rule code (e.g., Z001)\n");
+                return error.InvalidArgs;
+            }
+            if (parseRuleCode(args[i])) |rule| {
+                try ignored_rules.append(allocator, rule);
+            } else {
+                try writer.print("error: unknown rule code '{s}'\n", .{args[i]});
+                return error.InvalidArgs;
+            }
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try printUsage(writer);
             return error.InvalidArgs;
@@ -67,7 +128,17 @@ fn parseArgs(allocator: std.mem.Allocator, writer: *std.Io.Writer) !Config {
     }
 
     config.paths = paths.items;
+    config.ignored_rules = ignored_rules.items;
     return config;
+}
+
+fn parseRuleCode(code: []const u8) ?rules.Rule {
+    inline for (std.meta.fields(rules.Rule)) |field| {
+        if (std.mem.eql(u8, code, field.name)) {
+            return @enumFromInt(field.value);
+        }
+    }
+    return null;
 }
 
 fn detectZigLibPath(allocator: std.mem.Allocator, writer: *std.Io.Writer) !?[]const u8 {
@@ -102,20 +173,20 @@ fn parseLibDirFromZigEnv(allocator: std.mem.Allocator, output: []const u8) ?[]co
     return allocator.dupe(u8, output[value_start..end_idx]) catch null;
 }
 
-fn lintPath(allocator: std.mem.Allocator, path: []const u8, zig_lib_path: ?[]const u8, writer: *std.Io.Writer) !usize {
+fn lintPath(allocator: std.mem.Allocator, path: []const u8, zig_lib_path: ?[]const u8, ignored_rules: []const rules.Rule, use_color: bool, project_root: ?[]const u8, writer: *std.Io.Writer) !usize {
     const stat = std.fs.cwd().statFile(path) catch |err| {
         try writer.print("error: cannot access '{s}': {}\n", .{ path, err });
         return 0;
     };
 
     if (stat.kind == .directory) {
-        return lintDirectory(allocator, path, zig_lib_path, writer);
+        return lintDirectory(allocator, path, zig_lib_path, ignored_rules, use_color, project_root, writer);
     }
 
-    return lintFile(allocator, path, zig_lib_path, writer);
+    return lintFile(allocator, path, zig_lib_path, ignored_rules, use_color, project_root, writer);
 }
 
-fn lintDirectory(allocator: std.mem.Allocator, path: []const u8, zig_lib_path: ?[]const u8, writer: *std.Io.Writer) !usize {
+fn lintDirectory(allocator: std.mem.Allocator, path: []const u8, zig_lib_path: ?[]const u8, ignored_rules: []const rules.Rule, use_color: bool, project_root: ?[]const u8, writer: *std.Io.Writer) !usize {
     var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch |err| {
         try writer.print("error: cannot open directory '{s}': {}\n", .{ path, err });
         return 0;
@@ -125,7 +196,13 @@ fn lintDirectory(allocator: std.mem.Allocator, path: []const u8, zig_lib_path: ?
     const gitignore = loadGitignore(allocator, dir);
     defer if (gitignore) |g| allocator.free(g);
 
-    var total: usize = 0;
+    // Collect all .zig files first
+    var files: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (files.items) |f| allocator.free(f);
+        files.deinit(allocator);
+    }
+
     var walker = dir.walk(allocator) catch |err| {
         try writer.print("error: cannot walk directory '{s}': {}\n", .{ path, err });
         return 0;
@@ -138,9 +215,36 @@ fn lintDirectory(allocator: std.mem.Allocator, path: []const u8, zig_lib_path: ?
         if (!std.mem.endsWith(u8, entry.basename, ".zig")) continue;
 
         const full_path = std.fs.path.join(allocator, &.{ path, entry.path }) catch continue;
-        defer allocator.free(full_path);
+        files.append(allocator, full_path) catch {
+            allocator.free(full_path);
+            continue;
+        };
+    }
 
-        total += try lintFile(allocator, full_path, zig_lib_path, writer);
+    if (files.items.len == 0) return 0;
+
+    // Build module graph once using first file as root, then add all others
+    var graph = ModuleGraph.init(allocator, files.items[0], zig_lib_path) catch {
+        // Fall back to per-file linting without semantics
+        var total: usize = 0;
+        for (files.items) |file_path| {
+            total += try lintFileSimple(allocator, file_path, ignored_rules, use_color, project_root, writer);
+        }
+        return total;
+    };
+    defer graph.deinit();
+
+    // Add remaining files to the graph
+    for (files.items[1..]) |file_path| {
+        graph.addModulePublic(file_path);
+    }
+
+    var resolver: TypeResolver = .init(allocator, &graph);
+    defer resolver.deinit();
+
+    var total: usize = 0;
+    for (files.items) |file_path| {
+        total += try lintFileWithGraph(allocator, file_path, &graph, &resolver, ignored_rules, use_color, project_root, writer);
     }
 
     return total;
@@ -188,7 +292,19 @@ fn loadGitignore(allocator: std.mem.Allocator, dir: std.fs.Dir) ?[]const u8 {
     return dir.readFileAlloc(allocator, ".gitignore", 1024 * 64) catch null;
 }
 
-fn lintFile(allocator: std.mem.Allocator, path: []const u8, zig_lib_path: ?[]const u8, writer: *std.Io.Writer) !usize {
+fn lintFile(allocator: std.mem.Allocator, path: []const u8, zig_lib_path: ?[]const u8, ignored_rules: []const rules.Rule, use_color: bool, project_root: ?[]const u8, writer: *std.Io.Writer) !usize {
+    var graph = ModuleGraph.init(allocator, path, zig_lib_path) catch {
+        return lintFileSimple(allocator, path, ignored_rules, use_color, project_root, writer);
+    };
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(allocator, &graph);
+    defer resolver.deinit();
+
+    return lintFileWithGraph(allocator, path, &graph, &resolver, ignored_rules, use_color, project_root, writer);
+}
+
+fn lintFileSimple(allocator: std.mem.Allocator, path: []const u8, ignored_rules: []const rules.Rule, use_color: bool, project_root: ?[]const u8, writer: *std.Io.Writer) !usize {
     const source = std.fs.cwd().readFileAllocOptions(
         allocator,
         path,
@@ -202,40 +318,42 @@ fn lintFile(allocator: std.mem.Allocator, path: []const u8, zig_lib_path: ?[]con
     };
     defer allocator.free(source);
 
-    var graph = ModuleGraph.init(allocator, path, zig_lib_path) catch {
-        var linter: Linter = .init(allocator, source, path);
-        defer linter.deinit();
-        linter.lint();
-        for (linter.diagnostics.items) |diag| {
-            try diag.write(writer);
-        }
-        return linter.diagnostics.items.len;
-    };
-    defer graph.deinit();
+    var linter: Linter = .init(allocator, source, path);
+    defer linter.deinit();
+    linter.lint();
+    return writeDiagnostics(linter.diagnostics.items, ignored_rules, use_color, project_root, writer);
+}
 
-    var resolver: TypeResolver = .init(allocator, &graph);
-    defer resolver.deinit();
-
+fn lintFileWithGraph(allocator: std.mem.Allocator, path: []const u8, graph: *ModuleGraph, resolver: *TypeResolver, ignored_rules: []const rules.Rule, use_color: bool, project_root: ?[]const u8, writer: *std.Io.Writer) !usize {
     const mod = graph.getModule(path) orelse {
-        var linter: Linter = .init(allocator, source, path);
-        defer linter.deinit();
-        linter.lint();
-        for (linter.diagnostics.items) |diag| {
-            try diag.write(writer);
-        }
-        return linter.diagnostics.items.len;
+        return lintFileSimple(allocator, path, ignored_rules, use_color, project_root, writer);
     };
 
-    var linter: Linter = .initWithSemantics(allocator, mod.source, mod.path, &resolver, mod.path);
+    var linter: Linter = .initWithSemantics(allocator, mod.source, mod.path, resolver, mod.path);
     defer linter.deinit();
 
     linter.lint();
 
-    for (linter.diagnostics.items) |diag| {
-        try diag.write(writer);
-    }
+    return writeDiagnostics(linter.diagnostics.items, ignored_rules, use_color, project_root, writer);
+}
 
-    return linter.diagnostics.items.len;
+fn writeDiagnostics(diagnostics: []const Linter.Diagnostic, ignored_rules: []const rules.Rule, use_color: bool, project_root: ?[]const u8, writer: *std.Io.Writer) !usize {
+    var count: usize = 0;
+    for (diagnostics) |diag| {
+        var ignored = false;
+        for (ignored_rules) |ignored_rule| {
+            if (diag.rule == ignored_rule) {
+                ignored = true;
+                break;
+            }
+        }
+        if (!ignored) {
+            const display_path = makeRelativePath(diag.path, project_root);
+            try diag.write(writer, use_color, display_path);
+            count += 1;
+        }
+    }
+    return count;
 }
 
 fn printUsage(writer: *std.Io.Writer) !void {
@@ -245,6 +363,7 @@ fn printUsage(writer: *std.Io.Writer) !void {
         \\Lint Zig source files for style and correctness issues.
         \\
         \\Options:
+        \\  --ignore <rule>       Ignore a rule (e.g., Z001). Can be repeated.
         \\  --zig-lib-path <path> Override the path to the Zig standard library.
         \\                        Auto-detected from 'zig env' if not specified.
         \\  -h, --help            Show this help message.
