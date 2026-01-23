@@ -29,7 +29,7 @@ Directories are scanned recursively for `.zig` files.
 | Z008 | Comment divider line |
 | Z009 | Files with top-level fields should be PascalCase |
 | Z010 | Redundant type specifier; prefer `.value` over explicit type |
-| Z011 | Generic diagnostic message |
+| Z011 | Deprecated method call |
 | Z012 | Public function exposes private type |
 | Z013 | Unused import |
 | Z014 | Error set names should be PascalCase |
