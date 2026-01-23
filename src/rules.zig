@@ -20,6 +20,7 @@ pub const Rule = enum(u16) {
     Z017 = 17,
     Z018 = 18,
     Z019 = 19,
+    Z020 = 20,
 
     pub fn code(self: Rule) []const u8 {
         return @tagName(self);
@@ -100,6 +101,13 @@ pub const Rule = enum(u16) {
             .Z019 => {
                 try writer.print("returning {s}pointer{s}/{s}slice{s} to stack-allocated local {s}'{s}'{s}", .{
                     m, r, m, r, y, context, r,
+                });
+            },
+            // function returns error union but never returns/propagates errors
+            // context is function name
+            .Z020 => {
+                try writer.print("function {s}'{s}'{s} returns error union but never returns or propagates errors", .{
+                    y, context, r,
                 });
             },
         }

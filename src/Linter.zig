@@ -600,6 +600,173 @@ fn checkFnDecl(self: *Linter, node: Ast.Node.Index) void {
     }
 
     self.checkExposedPrivateType(node);
+    self.checkUselessErrorReturn(node, fn_proto);
+}
+
+fn checkUselessErrorReturn(self: *Linter, node: Ast.Node.Index, fn_proto: Ast.full.FnProto) void {
+    // Check if return type is an error union
+    const return_type = fn_proto.ast.return_type.unwrap() orelse return;
+    const is_error_union = self.tree.nodeTag(return_type) == .error_union or
+        self.hasInferredErrorUnion(return_type);
+    if (!is_error_union) return;
+
+    // Get function body
+    const body_node = self.tree.nodeData(node).node_and_node[1];
+
+    // Check if the body ever returns/propagates errors
+    if (self.bodyCanReturnError(body_node)) return;
+
+    // No error paths found - report
+    const name_token = fn_proto.name_token orelse return;
+    const name = self.tree.tokenSlice(name_token);
+    const loc = self.tree.tokenLocation(0, name_token);
+    self.report(loc, .Z020, name);
+}
+
+fn hasInferredErrorUnion(self: *Linter, return_type: Ast.Node.Index) bool {
+    // Check for inferred error union: `!T` syntax has a `!` token before the return type
+    const main_token = self.tree.nodeMainToken(return_type);
+    if (main_token == 0) return false;
+    const prev_token: Ast.TokenIndex = main_token - 1;
+    return std.mem.eql(u8, self.tree.tokenSlice(prev_token), "!");
+}
+
+fn bodyCanReturnError(self: *Linter, node: Ast.Node.Index) bool {
+    const tag = self.tree.nodeTag(node);
+
+    // Direct error indicators
+    if (tag == .@"try") return true;
+    if (tag == .error_value) return true;
+
+    // Check return statements for error values or calls that might propagate errors
+    if (tag == .@"return") {
+        if (self.tree.nodeData(node).opt_node.unwrap()) |expr| {
+            if (self.tree.nodeTag(expr) == .error_value) return true;
+            // Check for field_access like MyError.SomeError
+            if (self.tree.nodeTag(expr) == .field_access) {
+                const lhs = self.tree.nodeData(expr).node_and_token[0];
+                if (self.isErrorSetIdentifier(lhs)) return true;
+            }
+            // A return of a function call might propagate errors
+            // We can't know without type resolution, so be conservative
+            const expr_tag = self.tree.nodeTag(expr);
+            if (expr_tag == .call_one or expr_tag == .call_one_comma or
+                expr_tag == .call or expr_tag == .call_comma)
+            {
+                return true;
+            }
+        }
+    }
+
+    // Recursively check all child nodes
+    return self.anyChildCanReturnError(node);
+}
+
+fn isErrorSetIdentifier(self: *Linter, node: Ast.Node.Index) bool {
+    if (self.tree.nodeTag(node) != .identifier) return false;
+    const name = self.tree.tokenSlice(self.tree.nodeMainToken(node));
+    // Check if the identifier refers to a known error set (PascalCase ending in Error)
+    return std.mem.endsWith(u8, name, "Error");
+}
+
+fn anyChildCanReturnError(self: *Linter, node: Ast.Node.Index) bool {
+    const tag = self.tree.nodeTag(node);
+
+    switch (tag) {
+        .block, .block_semicolon => {
+            var buf: [2]Ast.Node.Index = undefined;
+            const stmts = self.tree.blockStatements(&buf, node) orelse return false;
+            for (stmts) |stmt| {
+                if (self.bodyCanReturnError(stmt)) return true;
+            }
+            return false;
+        },
+        .block_two, .block_two_semicolon => {
+            const data = self.tree.nodeData(node).opt_node_and_opt_node;
+            if (data[0].unwrap()) |n| {
+                if (self.bodyCanReturnError(n)) return true;
+            }
+            if (data[1].unwrap()) |n| {
+                if (self.bodyCanReturnError(n)) return true;
+            }
+            return false;
+        },
+        .@"if", .if_simple => {
+            const if_full = self.tree.fullIf(node) orelse return false;
+            if (self.bodyCanReturnError(if_full.ast.then_expr)) return true;
+            if (if_full.ast.else_expr.unwrap()) |else_expr| {
+                if (self.bodyCanReturnError(else_expr)) return true;
+            }
+            return false;
+        },
+        .@"while", .while_simple, .while_cont => {
+            const while_full = self.tree.fullWhile(node) orelse return false;
+            if (self.bodyCanReturnError(while_full.ast.then_expr)) return true;
+            if (while_full.ast.else_expr.unwrap()) |else_expr| {
+                if (self.bodyCanReturnError(else_expr)) return true;
+            }
+            return false;
+        },
+        .@"for", .for_simple => {
+            const for_full = self.tree.fullFor(node) orelse return false;
+            if (self.bodyCanReturnError(for_full.ast.then_expr)) return true;
+            if (for_full.ast.else_expr.unwrap()) |else_expr| {
+                if (self.bodyCanReturnError(else_expr)) return true;
+            }
+            return false;
+        },
+        .@"switch", .switch_comma => {
+            const switch_full = self.tree.fullSwitch(node) orelse return false;
+            for (switch_full.ast.cases) |case_idx| {
+                const case = self.tree.fullSwitchCase(case_idx) orelse continue;
+                if (self.bodyCanReturnError(case.ast.target_expr)) return true;
+            }
+            return false;
+        },
+        .@"catch" => {
+            // Both the LHS (error-producing expr) and RHS (catch body) need checking
+            const data = self.tree.nodeData(node).node_and_node;
+            if (self.bodyCanReturnError(data[0])) return true;
+            if (self.bodyCanReturnError(data[1])) return true;
+            return false;
+        },
+        .@"orelse" => {
+            const data = self.tree.nodeData(node).node_and_node;
+            if (self.bodyCanReturnError(data[0])) return true;
+            if (self.bodyCanReturnError(data[1])) return true;
+            return false;
+        },
+        .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => {
+            const var_decl = self.tree.fullVarDecl(node) orelse return false;
+            if (var_decl.ast.init_node.unwrap()) |init_node| {
+                if (self.bodyCanReturnError(init_node)) return true;
+            }
+            return false;
+        },
+        .assign => {
+            const data = self.tree.nodeData(node).node_and_node;
+            if (self.bodyCanReturnError(data[1])) return true;
+            return false;
+        },
+        .call_one, .call_one_comma, .call, .call_comma => {
+            // Function calls could return errors - but we can't know without deeper analysis
+            // For now, we conservatively assume calls don't return errors
+            // (the function itself would have the error union if it did)
+            var buf: [1]Ast.Node.Index = undefined;
+            const call = self.tree.fullCall(&buf, node) orelse return false;
+            for (call.ast.params) |param| {
+                if (self.bodyCanReturnError(param)) return true;
+            }
+            return false;
+        },
+        .@"return" => {
+            if (self.tree.nodeData(node).opt_node.unwrap()) |expr| {
+                if (self.bodyCanReturnError(expr)) return true;
+            }
+            return false;
+        },
+        else => return false,
+    }
 }
 
 fn checkVarDecl(self: *Linter, node: Ast.Node.Index) void {
@@ -1766,7 +1933,10 @@ test "Z012: pub fn returning optional private type" {
 test "Z012: pub fn returning error union with private type" {
     var linter: Linter = .init(std.testing.allocator,
         \\const Private = struct {};
-        \\pub fn getPrivateOrError() !Private { return .{}; }
+        \\pub fn getPrivateOrError() !Private {
+        \\    if (false) return error.Fail;
+        \\    return .{};
+        \\}
     , "test.zig");
     defer linter.deinit();
     linter.lint();
@@ -1777,7 +1947,9 @@ test "Z012: pub fn returning error union with private type" {
 test "Z015: pub fn returning private error set" {
     var linter: Linter = .init(std.testing.allocator,
         \\const Oom = error{OutOfMemory};
-        \\pub fn doThing() Oom!void {}
+        \\pub fn doThing() Oom!void {
+        \\    return error.OutOfMemory;
+        \\}
     , "test.zig");
     defer linter.deinit();
     linter.lint();
@@ -2046,5 +2218,91 @@ test "Z016: simple assert is ok" {
     linter.lint();
     for (linter.diagnostics.items) |d| {
         try std.testing.expect(d.rule != rules.Rule.Z016);
+    }
+}
+
+test "Z020: error union return with no error propagation" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn useless() !void {
+        \\    return;
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z020) {
+            found = true;
+            try std.testing.expectEqualStrings("useless", d.context);
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "Z020: error union with try is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn fallible() !u32 { return error.Fail; }
+        \\fn valid() !u32 {
+        \\    return try fallible();
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z020);
+    }
+}
+
+test "Z020: error union with return error.X is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn valid() !void {
+        \\    if (true) return error.Oops;
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z020);
+    }
+}
+
+test "Z020: non-error-union return is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn normal() void {
+        \\    return;
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z020);
+    }
+}
+
+test "Z020: explicit error set without propagation" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn useless() error{Foo}!void {
+        \\    return;
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z020) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "Z020: return call is conservative ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn wrapper() !u32 {
+        \\    return someFn();
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z020);
     }
 }
