@@ -19,6 +19,7 @@ pub const Rule = enum(u16) {
     Z016 = 16,
     Z017 = 17,
     Z018 = 18,
+    Z019 = 19,
 
     pub fn code(self: Rule) []const u8 {
         return @tagName(self);
@@ -92,6 +93,13 @@ pub const Rule = enum(u16) {
             .Z018 => {
                 try writer.print("redundant {s}@as{s}{s}({s}{s}{s}{s}, ...){s}: type {s}{s}{s} already known from context", .{
                     b, r, d, r, m, context, d, r, m, context, r,
+                });
+            },
+            // returning pointer/slice to stack-allocated local
+            // context is variable name
+            .Z019 => {
+                try writer.print("returning {s}pointer{s}/{s}slice{s} to stack-allocated local {s}'{s}'{s}", .{
+                    m, r, m, r, y, context, r,
                 });
             },
         }

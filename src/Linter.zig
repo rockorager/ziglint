@@ -22,6 +22,8 @@ imported_types: std.StringHashMapUnmanaged(void) = .empty,
 import_bindings: std.StringHashMapUnmanaged(ImportInfo) = .empty,
 used_identifiers: std.StringHashMapUnmanaged(void) = .empty,
 current_fn_return_type: Ast.Node.OptionalIndex = .none,
+local_vars: std.StringHashMapUnmanaged(void) = .empty,
+in_function_body: bool = false,
 
 const ImportInfo = struct {
     name_token: Ast.TokenIndex,
@@ -114,6 +116,7 @@ pub fn deinit(self: *Linter) void {
     self.imported_types.deinit(self.allocator);
     self.import_bindings.deinit(self.allocator);
     self.used_identifiers.deinit(self.allocator);
+    self.local_vars.deinit(self.allocator);
 }
 
 pub fn lint(self: *Linter) void {
@@ -518,7 +521,13 @@ fn visitNode(self: *Linter, node: Ast.Node.Index) void {
 
     switch (tag) {
         .fn_decl => self.checkFnDecl(node),
-        .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => self.checkVarDecl(node),
+        .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => {
+            self.checkVarDecl(node);
+            // Track local variables for returned-stack-reference check
+            if (self.in_function_body) {
+                self.trackLocalVar(node);
+            }
+        },
         .@"return" => self.checkReturn(node),
         .call_one, .call_one_comma, .call, .call_comma => {
             self.checkCallArgs(node);
@@ -540,12 +549,17 @@ fn visitChildren(self: *Linter, node: Ast.Node.Index) void {
             var buf: [1]Ast.Node.Index = undefined;
             const fn_proto = self.tree.fullFnProto(&buf, node);
             const prev_return_type = self.current_fn_return_type;
+            const prev_in_function_body = self.in_function_body;
             if (fn_proto) |proto| {
                 self.current_fn_return_type = proto.ast.return_type;
             }
+            // Clear local vars and mark that we're in a function body
+            self.local_vars.clearRetainingCapacity();
+            self.in_function_body = true;
             self.visitNode(data[0]);
             self.visitNode(data[1]);
             self.current_fn_return_type = prev_return_type;
+            self.in_function_body = prev_in_function_body;
         },
         .block, .block_semicolon => {
             var buf: [2]Ast.Node.Index = undefined;
@@ -695,6 +709,7 @@ fn checkReturn(self: *Linter, node: Ast.Node.Index) void {
     self.checkRedundantType(return_expr, true);
     self.checkReturnTry(node, return_expr);
     self.checkRedundantAsInReturn(node, return_expr);
+    self.checkReturnedStackReference(node, return_expr);
 }
 
 fn checkReturnTry(self: *Linter, return_node: Ast.Node.Index, return_expr: Ast.Node.Index) void {
@@ -722,6 +737,41 @@ fn checkRedundantAsInReturn(self: *Linter, return_node: Ast.Node.Index, return_e
     if (std.mem.eql(u8, as_type_name, fn_return_name)) {
         const loc = self.tree.tokenLocation(0, self.tree.nodeMainToken(return_node));
         self.report(loc, .Z018, as_type_name);
+    }
+}
+
+fn trackLocalVar(self: *Linter, node: Ast.Node.Index) void {
+    const var_decl = self.tree.fullVarDecl(node) orelse return;
+    const name_token = var_decl.ast.mut_token + 1;
+    const name = self.tree.tokenSlice(name_token);
+    self.local_vars.put(self.allocator, name, {}) catch {};
+}
+
+fn checkReturnedStackReference(self: *Linter, return_node: Ast.Node.Index, return_expr: Ast.Node.Index) void {
+    const tag = self.tree.nodeTag(return_expr);
+
+    // Check for &local_var
+    if (tag == .address_of) {
+        const operand = self.tree.nodeData(return_expr).node;
+        if (self.tree.nodeTag(operand) == .identifier) {
+            const name = self.tree.tokenSlice(self.tree.nodeMainToken(operand));
+            if (self.local_vars.contains(name)) {
+                const loc = self.tree.tokenLocation(0, self.tree.nodeMainToken(return_node));
+                self.report(loc, .Z019, name);
+            }
+        }
+    }
+
+    // Check for slices of local arrays: local_array[..]
+    if (tag == .slice_open or tag == .slice or tag == .slice_sentinel) {
+        const slice = self.tree.fullSlice(return_expr) orelse return;
+        if (self.tree.nodeTag(slice.ast.sliced) == .identifier) {
+            const name = self.tree.tokenSlice(self.tree.nodeMainToken(slice.ast.sliced));
+            if (self.local_vars.contains(name)) {
+                const loc = self.tree.tokenLocation(0, self.tree.nodeMainToken(return_node));
+                self.report(loc, .Z019, name);
+            }
+        }
     }
 }
 
