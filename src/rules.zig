@@ -17,6 +17,7 @@ pub const Rule = enum(u16) {
     Z014 = 14,
     Z015 = 15,
     Z016 = 16,
+    Z017 = 17,
 
     pub fn code(self: Rule) []const u8 {
         return @tagName(self);
@@ -75,6 +76,14 @@ pub const Rule = enum(u16) {
                 });
                 try writer.print(" -> {s}`{s}{s}assert{s}{s}({s}{s}a{s}{s}); {s}{s}assert{s}{s}({s}{s}b{s}{s});`{s}", .{
                     d, r, b, r, d, r, y, r, d, r, b, r, d, r, y, r, d, r,
+                });
+            },
+            // return=purple, try=purple, expr=yellow, punctuation=dim
+            // `return try expr` -> `return expr`
+            .Z017 => {
+                // redundant `try` in `return`: `return try expr` -> `return expr`
+                try writer.print("redundant {s}try{s} in {s}return{s}: {s}`return try {s}{s}{s}`{s} -> {s}`return {s}{s}{s}`{s}", .{
+                    p, r, p, r, d, y, context, d, r, d, y, context, d, r,
                 });
             },
         }

@@ -665,6 +665,20 @@ fn checkDupeImport(self: *Linter, var_decl: Ast.full.VarDecl, name_token: Ast.To
 fn checkReturn(self: *Linter, node: Ast.Node.Index) void {
     const return_expr = self.tree.nodeData(node).opt_node.unwrap() orelse return;
     self.checkRedundantType(return_expr, true);
+    self.checkReturnTry(node, return_expr);
+}
+
+fn checkReturnTry(self: *Linter, return_node: Ast.Node.Index, return_expr: Ast.Node.Index) void {
+    // Check if the return expression is a try
+    if (self.tree.nodeTag(return_expr) != .@"try") return;
+
+    // Get the inner expression being tried
+    const try_expr = self.tree.nodeData(return_expr).node;
+    const expr_source = self.getNodeSource(try_expr);
+    const truncated = truncateExpr(expr_source);
+
+    const loc = self.tree.tokenLocation(0, self.tree.nodeMainToken(return_node));
+    self.report(loc, .Z017, truncated);
 }
 
 fn checkCallArgs(self: *Linter, node: Ast.Node.Index) void {
