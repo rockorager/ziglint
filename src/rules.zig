@@ -82,8 +82,8 @@ pub const Rule = enum(u16) {
             // `return try expr` -> `return expr`
             .Z017 => {
                 // redundant `try` in `return`: `return try expr` -> `return expr`
-                try writer.print("redundant {s}try{s} in {s}return{s}: {s}`return try {s}{s}{s}`{s} -> {s}`return {s}{s}{s}`{s}", .{
-                    p, r, p, r, d, y, context, d, r, d, y, context, d, r,
+                try writer.print("redundant {s}try{s} in {s}return{s}: {s}`{s}return try {s}{s}{s}`{s} -> {s}`{s}return {s}{s}{s}`{s}", .{
+                    p, r, p, r, d, r, y, context, d, r, d, r, y, context, d, r,
                 });
             },
             // redundant @as when type is already known from context
