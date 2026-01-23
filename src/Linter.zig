@@ -21,6 +21,7 @@ public_types: std.StringHashMapUnmanaged(void) = .empty,
 imported_types: std.StringHashMapUnmanaged(void) = .empty,
 import_bindings: std.StringHashMapUnmanaged(ImportInfo) = .empty,
 used_identifiers: std.StringHashMapUnmanaged(void) = .empty,
+current_fn_return_type: Ast.Node.OptionalIndex = .none,
 
 const ImportInfo = struct {
     name_token: Ast.TokenIndex,
@@ -535,8 +536,16 @@ fn visitChildren(self: *Linter, node: Ast.Node.Index) void {
     switch (tag) {
         .fn_decl => {
             const data = self.tree.nodeData(node).node_and_node;
+            // Track the function's return type for checks inside the body
+            var buf: [1]Ast.Node.Index = undefined;
+            const fn_proto = self.tree.fullFnProto(&buf, node);
+            const prev_return_type = self.current_fn_return_type;
+            if (fn_proto) |proto| {
+                self.current_fn_return_type = proto.ast.return_type;
+            }
             self.visitNode(data[0]);
             self.visitNode(data[1]);
+            self.current_fn_return_type = prev_return_type;
         },
         .block, .block_semicolon => {
             var buf: [2]Ast.Node.Index = undefined;
@@ -616,6 +625,25 @@ fn checkVarDecl(self: *Linter, node: Ast.Node.Index) void {
 
     self.checkDupeImport(var_decl, name_token);
     self.trackImportBinding(node, var_decl, name_token);
+    self.checkRedundantAsInVarDecl(var_decl);
+}
+
+fn checkRedundantAsInVarDecl(self: *Linter, var_decl: Ast.full.VarDecl) void {
+    // Need both a type annotation and an init expression
+    const type_node = var_decl.ast.type_node.unwrap() orelse return;
+    const init_node = var_decl.ast.init_node.unwrap() orelse return;
+
+    // Get the declared type name
+    const decl_type_name = self.getTypeNodeName(type_node) orelse return;
+
+    // Get the @as type from init expression
+    const as_type_name = self.getAsTypeName(init_node) orelse return;
+
+    // Compare types
+    if (std.mem.eql(u8, decl_type_name, as_type_name)) {
+        const loc = self.tree.tokenLocation(0, self.tree.nodeMainToken(init_node));
+        self.report(loc, .Z018, as_type_name);
+    }
 }
 
 fn trackImportBinding(self: *Linter, node: Ast.Node.Index, var_decl: Ast.full.VarDecl, name_token: Ast.TokenIndex) void {
@@ -666,6 +694,7 @@ fn checkReturn(self: *Linter, node: Ast.Node.Index) void {
     const return_expr = self.tree.nodeData(node).opt_node.unwrap() orelse return;
     self.checkRedundantType(return_expr, true);
     self.checkReturnTry(node, return_expr);
+    self.checkRedundantAsInReturn(node, return_expr);
 }
 
 fn checkReturnTry(self: *Linter, return_node: Ast.Node.Index, return_expr: Ast.Node.Index) void {
@@ -679,6 +708,45 @@ fn checkReturnTry(self: *Linter, return_node: Ast.Node.Index, return_expr: Ast.N
 
     const loc = self.tree.tokenLocation(0, self.tree.nodeMainToken(return_node));
     self.report(loc, .Z017, truncated);
+}
+
+fn checkRedundantAsInReturn(self: *Linter, return_node: Ast.Node.Index, return_expr: Ast.Node.Index) void {
+    // Get the @as type from return expression
+    const as_type_name = self.getAsTypeName(return_expr) orelse return;
+
+    // Get function's return type
+    const fn_return_type = self.current_fn_return_type.unwrap() orelse return;
+    const fn_return_name = self.getTypeNodeName(fn_return_type) orelse return;
+
+    // Compare types
+    if (std.mem.eql(u8, as_type_name, fn_return_name)) {
+        const loc = self.tree.tokenLocation(0, self.tree.nodeMainToken(return_node));
+        self.report(loc, .Z018, as_type_name);
+    }
+}
+
+fn getAsTypeName(self: *Linter, node: Ast.Node.Index) ?[]const u8 {
+    const tag = self.tree.nodeTag(node);
+    if (tag != .builtin_call_two and tag != .builtin_call_two_comma and
+        tag != .builtin_call and tag != .builtin_call_comma) return null;
+
+    const main_token = self.tree.nodeMainToken(node);
+    const builtin_name = self.tree.tokenSlice(main_token);
+    if (!std.mem.eql(u8, builtin_name, "@as")) return null;
+
+    var buf: [2]Ast.Node.Index = undefined;
+    const params = self.tree.builtinCallParams(&buf, node) orelse return null;
+    if (params.len < 1) return null;
+
+    return self.getTypeNodeName(params[0]);
+}
+
+fn getTypeNodeName(self: *Linter, type_node: Ast.Node.Index) ?[]const u8 {
+    const tag = self.tree.nodeTag(type_node);
+    return switch (tag) {
+        .identifier => self.tree.tokenSlice(self.tree.nodeMainToken(type_node)),
+        else => null,
+    };
 }
 
 fn checkCallArgs(self: *Linter, node: Ast.Node.Index) void {

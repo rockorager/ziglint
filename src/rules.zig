@@ -18,6 +18,7 @@ pub const Rule = enum(u16) {
     Z015 = 15,
     Z016 = 16,
     Z017 = 17,
+    Z018 = 18,
 
     pub fn code(self: Rule) []const u8 {
         return @tagName(self);
@@ -84,6 +85,13 @@ pub const Rule = enum(u16) {
                 // redundant `try` in `return`: `return try expr` -> `return expr`
                 try writer.print("redundant {s}try{s} in {s}return{s}: {s}`return try {s}{s}{s}`{s} -> {s}`return {s}{s}{s}`{s}", .{
                     p, r, p, r, d, y, context, d, r, d, y, context, d, r,
+                });
+            },
+            // redundant @as when type is already known from context
+            // context is type name
+            .Z018 => {
+                try writer.print("redundant {s}@as{s}{s}({s}{s}{s}{s}, ...){s}: type {s}{s}{s} already known from context", .{
+                    b, r, d, r, m, context, d, r, m, context, r,
                 });
             },
         }
