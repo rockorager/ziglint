@@ -1,11 +1,14 @@
 //! ziglint - A linter for Zig source code
 
 const std = @import("std");
+const build_options = @import("build_options");
 const Linter = @import("Linter.zig");
 const ModuleGraph = @import("ModuleGraph.zig");
 const TypeResolver = @import("TypeResolver.zig");
 
 const rules = @import("rules.zig");
+
+pub const version = build_options.version;
 
 pub const Config = struct {
     zig_lib_path: ?[]const u8 = null,
@@ -48,10 +51,15 @@ pub fn main() !u8 {
 }
 
 fn detectColorSupport(file: std.fs.File) bool {
+    const native = @import("builtin").os.tag;
     // NO_COLOR takes precedence (https://no-color.org/)
-    if (std.posix.getenv("NO_COLOR")) |_| return false;
-    // FORCE_COLOR forces color on even if not a TTY
-    if (std.posix.getenv("FORCE_COLOR")) |_| return true;
+    if (native == .windows) {
+        if (std.process.getenvW(std.unicode.utf8ToUtf16LeStringLiteral("NO_COLOR"))) |_| return false;
+        if (std.process.getenvW(std.unicode.utf8ToUtf16LeStringLiteral("FORCE_COLOR"))) |_| return true;
+    } else {
+        if (std.posix.getenv("NO_COLOR")) |_| return false;
+        if (std.posix.getenv("FORCE_COLOR")) |_| return true;
+    }
     // Otherwise, use color if stdout is a TTY
     return file.isTty();
 }
@@ -118,6 +126,9 @@ fn parseArgs(allocator: std.mem.Allocator, writer: *std.Io.Writer) !Config {
             }
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try printUsage(writer);
+            return error.InvalidArgs;
+        } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
+            try printVersion(writer);
             return error.InvalidArgs;
         } else if (std.mem.startsWith(u8, arg, "-")) {
             try writer.print("error: unknown option '{s}'\n", .{arg});
@@ -367,10 +378,15 @@ fn printUsage(writer: *std.Io.Writer) !void {
         \\  --zig-lib-path <path> Override the path to the Zig standard library.
         \\                        Auto-detected from 'zig env' if not specified.
         \\  -h, --help            Show this help message.
+        \\  -v, --version         Show version.
         \\
         \\Directories are scanned recursively for .zig files.
         \\
     );
+}
+
+fn printVersion(writer: *std.Io.Writer) !void {
+    try writer.writeAll("ziglint " ++ version ++ "\n");
 }
 
 test {

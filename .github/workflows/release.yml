@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-macos
+            artifact: ziglint-aarch64-macos
+          - target: x86_64-linux
+            artifact: ziglint-x86_64-linux
+          - target: x86_64-windows
+            artifact: ziglint-x86_64-windows
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: ${{ !contains(matrix.target, 'windows') }}
+        run: |
+          mkdir -p dist
+          tar -czvf dist/${{ matrix.artifact }}.tar.gz -C zig-out/bin ziglint
+
+      - name: Package (Windows)
+        if: ${{ contains(matrix.target, 'windows') }}
+        run: |
+          mkdir -p dist
+          zip -j dist/${{ matrix.artifact }}.zip zig-out/bin/ziglint.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}.*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Read release notes
+        id: notes
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          NOTES_FILE="docs/releases/${VERSION}.md"
+          if [ -f "$NOTES_FILE" ]; then
+            echo "Release notes found at $NOTES_FILE"
+            {
+              echo "BODY<<EOF"
+              cat "$NOTES_FILE"
+              echo "EOF"
+            } >> $GITHUB_OUTPUT
+          else
+            echo "No release notes found at $NOTES_FILE"
+            echo "BODY=Release $VERSION" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ steps.version.outputs.VERSION }}
+          body: ${{ steps.notes.outputs.BODY }}
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
+            artifacts/checksums.txt
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.VERSION, '-') }}
