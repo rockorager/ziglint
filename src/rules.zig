@@ -21,6 +21,7 @@ pub const Rule = enum(u16) {
     Z019 = 19,
     Z020 = 20,
     Z021 = 21,
+    Z022 = 22,
 
     pub fn code(self: Rule) []const u8 {
         return @tagName(self);
@@ -110,6 +111,10 @@ pub const Rule = enum(u16) {
                 const alias = context[0..sep];
                 const expected = if (sep < context.len) context[sep + 1 ..] else context;
                 try writer.print("{s}@This(){s} alias {s}'{s}'{s} should match filename {s}'{s}'{s}", .{ b, r, y, alias, r, y, expected, r });
+            },
+            // @This() alias in anonymous/local struct should be Self
+            .Z022 => {
+                try writer.print("{s}@This(){s} alias {s}'{s}'{s} should be {s}'Self'{s}", .{ b, r, y, context, r, y, r });
             },
         }
     }

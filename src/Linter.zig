@@ -345,8 +345,8 @@ fn checkThisBuiltin(self: *Linter) void {
             continue;
         }
 
-        // Check 3: If at file level in a file-as-struct (has top-level fields), alias should match filename
-        if (self.isAtFileLevel(node) and self.hasTopLevelFields()) {
+        // Check 3: If at file level, alias should match filename or be Self
+        if (self.isAtFileLevel(node)) {
             const basename = std.fs.path.basename(self.path);
             const expected = if (std.mem.endsWith(u8, basename, ".zig"))
                 basename[0 .. basename.len - 4]
@@ -357,13 +357,20 @@ fn checkThisBuiltin(self: *Linter) void {
             const is_self = std.mem.eql(u8, alias_name, "Self");
             const matches_filename = std.ascii.eqlIgnoreCase(alias_name, expected);
             if (!is_self and !matches_filename) {
-                // Z021: alias doesn't match filename or Self
-                const context = self.allocator.alloc(u8, alias_name.len + 1 + expected.len) catch continue;
-                @memcpy(context[0..alias_name.len], alias_name);
-                context[alias_name.len] = 0;
-                @memcpy(context[alias_name.len + 1 ..], expected);
-                self.allocated_contexts.append(self.allocator, context) catch {};
-                self.report(loc, .Z021, context);
+                // Z021: alias doesn't match filename or Self (only for file-as-struct)
+                if (self.hasTopLevelFields()) {
+                    const context = self.allocator.alloc(u8, alias_name.len + 1 + expected.len) catch continue;
+                    @memcpy(context[0..alias_name.len], alias_name);
+                    context[alias_name.len] = 0;
+                    @memcpy(context[alias_name.len + 1 ..], expected);
+                    self.allocated_contexts.append(self.allocator, context) catch {};
+                    self.report(loc, .Z021, context);
+                }
+            }
+        } else {
+            // Check 4: In anonymous/local struct, alias must be "Self"
+            if (!std.mem.eql(u8, alias_name, "Self")) {
+                self.report(loc, .Z022, alias_name);
             }
         }
     }
@@ -2353,4 +2360,59 @@ test "Z021: file-struct @This() alias Self is ok" {
     for (linter.diagnostics.items) |d| {
         try std.testing.expect(d.rule != rules.Rule.Z021);
     }
+}
+
+test "Z022: anonymous struct @This() alias should be Self" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn Generic(comptime T: type) type {
+        \\    _ = T;
+        \\    return struct {
+        \\        const This = @This();
+        \\    };
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z022) {
+            found = true;
+            try std.testing.expectEqualStrings("This", d.context);
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "Z022: anonymous struct @This() alias Self is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn Generic(comptime T: type) type {
+        \\    _ = T;
+        \\    return struct {
+        \\        const Self = @This();
+        \\    };
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z022);
+    }
+}
+
+test "Z022: local struct @This() alias should be Self" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo() void {
+        \\    const Local = struct {
+        \\        const This = @This();
+        \\    };
+        \\    _ = Local;
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z022) found = true;
+    }
+    try std.testing.expect(found);
 }
