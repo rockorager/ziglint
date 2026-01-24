@@ -774,6 +774,9 @@ fn visitNode(self: *Linter, node: Ast.Node.Index) void {
             self.checkDeprecatedCall(node);
             self.checkCompoundAssert(node);
         },
+        .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {
+            self.checkMissingAlignCast(node);
+        },
         else => {},
     }
 
@@ -805,6 +808,21 @@ fn visitChildren(self: *Linter, node: Ast.Node.Index) void {
             const data = self.tree.nodeData(node).opt_node_and_opt_node;
             if (data[0].unwrap()) |n| self.visitNode(n);
             if (data[1].unwrap()) |n| self.visitNode(n);
+        },
+        .@"return" => {
+            if (self.tree.nodeData(node).opt_node.unwrap()) |expr| {
+                self.visitNode(expr);
+            }
+        },
+        .builtin_call_two, .builtin_call_two_comma => {
+            const data = self.tree.nodeData(node).opt_node_and_opt_node;
+            if (data[0].unwrap()) |n| self.visitNode(n);
+            if (data[1].unwrap()) |n| self.visitNode(n);
+        },
+        .builtin_call, .builtin_call_comma => {
+            var buf: [2]Ast.Node.Index = undefined;
+            const params = self.tree.builtinCallParams(&buf, node) orelse return;
+            for (params) |param| self.visitNode(param);
         },
         else => {},
     }
@@ -1077,6 +1095,33 @@ fn checkCompoundAssert(self: *Linter, node: Ast.Node.Index) void {
 
     const loc = self.tree.tokenLocation(0, self.tree.nodeMainToken(node));
     self.report(loc, .Z016, "and");
+}
+
+fn checkMissingAlignCast(self: *Linter, node: Ast.Node.Index) void {
+    const main_token = self.tree.nodeMainToken(node);
+    const builtin_name = self.tree.tokenSlice(main_token);
+
+    // Only check @ptrCast
+    if (!std.mem.eql(u8, builtin_name, "@ptrCast")) return;
+
+    // Get the argument to @ptrCast
+    var buf: [2]Ast.Node.Index = undefined;
+    const params = self.tree.builtinCallParams(&buf, node) orelse return;
+    if (params.len == 0) return;
+
+    const arg = params[0];
+    const arg_tag = self.tree.nodeTag(arg);
+
+    // Check if argument is @alignCast
+    if (arg_tag == .builtin_call_two or arg_tag == .builtin_call_two_comma or
+        arg_tag == .builtin_call or arg_tag == .builtin_call_comma)
+    {
+        const arg_builtin = self.tree.tokenSlice(self.tree.nodeMainToken(arg));
+        if (std.mem.eql(u8, arg_builtin, "@alignCast")) return;
+    }
+
+    const loc = self.tree.tokenLocation(0, main_token);
+    self.report(loc, .Z025, "");
 }
 
 fn checkRedundantType(self: *Linter, node: Ast.Node.Index, check_field_access: bool) void {
@@ -2415,4 +2460,47 @@ test "Z022: local struct @This() alias should be Self" {
         if (d.rule == rules.Rule.Z022) found = true;
     }
     try std.testing.expect(found);
+}
+
+test "Z025: detect @ptrCast without @alignCast" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo(ptr: *anyopaque) *u32 {
+        \\    return @ptrCast(ptr);
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z025) {
+            found = true;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "Z025: allow @ptrCast with @alignCast" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo(ptr: *anyopaque) *u32 {
+        \\    return @ptrCast(@alignCast(ptr));
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z025);
+    }
+}
+
+test "Z025: allow standalone @alignCast" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo(ptr: *anyopaque) *align(4) anyopaque {
+        \\    return @alignCast(ptr);
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z025);
+    }
 }
