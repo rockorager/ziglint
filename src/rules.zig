@@ -22,6 +22,7 @@ pub const Rule = enum(u16) {
     Z020 = 20,
     Z021 = 21,
     Z022 = 22,
+    Z024 = 24,
 
     pub fn code(self: Rule) []const u8 {
         return @tagName(self);
@@ -115,6 +116,13 @@ pub const Rule = enum(u16) {
             // @This() alias in anonymous/local struct should be Self
             .Z022 => {
                 try writer.print("{s}@This(){s} alias {s}'{s}'{s} should be {s}'Self'{s}", .{ b, r, y, context, r, y, r });
+            },
+            // unbounded loop
+            .Z024 => {
+                // while=purple, true=yellow
+                try writer.print("{s}while{s} {s}({s}{s}true{s}{s}){s} loop without {s}break{s} or {s}return{s}", .{
+                    p, r, d, r, y, r, d, r, p, r, p, r,
+                });
             },
         }
     }

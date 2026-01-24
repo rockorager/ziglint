@@ -389,7 +389,7 @@ fn hasTopLevelFields(self: *Linter) bool {
 fn isAtFileLevel(self: *Linter, start_node: Ast.Node.Index) bool {
     var current = start_node;
 
-    while (true) {
+    while (true) { // ziglint-ignore: Z024
         const parent_opt = self.parent_map[@intFromEnum(current)];
         const parent = parent_opt.unwrap() orelse return true; // No parent = root level
         const parent_tag = self.tree.nodeTag(parent);
@@ -774,6 +774,7 @@ fn visitNode(self: *Linter, node: Ast.Node.Index) void {
             self.checkDeprecatedCall(node);
             self.checkCompoundAssert(node);
         },
+        .while_simple, .while_cont, .@"while" => self.checkUnboundedLoop(node),
         else => {},
     }
 
@@ -805,6 +806,13 @@ fn visitChildren(self: *Linter, node: Ast.Node.Index) void {
             const data = self.tree.nodeData(node).opt_node_and_opt_node;
             if (data[0].unwrap()) |n| self.visitNode(n);
             if (data[1].unwrap()) |n| self.visitNode(n);
+        },
+        .while_simple, .while_cont, .@"while" => {
+            const while_info = self.tree.fullWhile(node) orelse return;
+            self.visitNode(while_info.ast.then_expr);
+            if (while_info.ast.else_expr.unwrap()) |else_expr| {
+                self.visitNode(else_expr);
+            }
         },
         else => {},
     }
@@ -1077,6 +1085,67 @@ fn checkCompoundAssert(self: *Linter, node: Ast.Node.Index) void {
 
     const loc = self.tree.tokenLocation(0, self.tree.nodeMainToken(node));
     self.report(loc, .Z016, "and");
+}
+
+fn checkUnboundedLoop(self: *Linter, node: Ast.Node.Index) void {
+    const while_info = self.tree.fullWhile(node) orelse return;
+
+    // Check if condition is `true` literal
+    if (!self.isConditionTrue(while_info.ast.cond_expr)) return;
+
+    // Check if body contains break or return
+    if (self.bodyHasTerminator(while_info.ast.then_expr)) return;
+
+    const loc = self.tree.tokenLocation(0, while_info.ast.while_token);
+    self.report(loc, .Z024, "");
+}
+
+fn isConditionTrue(self: *Linter, node: Ast.Node.Index) bool {
+    const tag = self.tree.nodeTag(node);
+    if (tag != .identifier) return false;
+    const name = self.tree.tokenSlice(self.tree.nodeMainToken(node));
+    return std.mem.eql(u8, name, "true");
+}
+
+fn bodyHasTerminator(self: *Linter, body_node: Ast.Node.Index) bool {
+    return self.nodeContainsTerminator(body_node);
+}
+
+fn nodeContainsTerminator(self: *Linter, node: Ast.Node.Index) bool {
+    const tag = self.tree.nodeTag(node);
+
+    // Direct terminator statements
+    if (tag == .@"break" or tag == .@"return") return true;
+
+    // Check block contents
+    if (tag == .block or tag == .block_semicolon) {
+        var buf: [2]Ast.Node.Index = undefined;
+        const stmts = self.tree.blockStatements(&buf, node) orelse return false;
+        for (stmts) |stmt| {
+            if (self.nodeContainsTerminator(stmt)) return true;
+        }
+    }
+
+    if (tag == .block_two or tag == .block_two_semicolon) {
+        const data = self.tree.nodeData(node).opt_node_and_opt_node;
+        if (data[0].unwrap()) |n| {
+            if (self.nodeContainsTerminator(n)) return true;
+        }
+        if (data[1].unwrap()) |n| {
+            if (self.nodeContainsTerminator(n)) return true;
+        }
+    }
+
+    // Check if statements
+    if (tag == .@"if" or tag == .if_simple) {
+        const if_info = self.tree.fullIf(node) orelse return false;
+        if (self.nodeContainsTerminator(if_info.ast.then_expr)) return true;
+        if (if_info.ast.else_expr.unwrap()) |else_expr| {
+            if (self.nodeContainsTerminator(else_expr)) return true;
+        }
+    }
+
+    return false;
 }
 
 fn checkRedundantType(self: *Linter, node: Ast.Node.Index, check_field_access: bool) void {
@@ -2415,4 +2484,71 @@ test "Z022: local struct @This() alias should be Self" {
         if (d.rule == rules.Rule.Z022) found = true;
     }
     try std.testing.expect(found);
+}
+
+test "Z024: detect while(true) without break" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo() void {
+        \\    while (true) {
+        \\        process();
+        \\    }
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z024) {
+            found = true;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "Z024: allow while(true) with break" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo() void {
+        \\    while (true) {
+        \\        if (done) break;
+        \\        process();
+        \\    }
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z024);
+    }
+}
+
+test "Z024: allow while(true) with return" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo() void {
+        \\    while (true) {
+        \\        if (done) return;
+        \\        process();
+        \\    }
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z024);
+    }
+}
+
+test "Z024: allow while with condition" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo() void {
+        \\    while (i < 10) {
+        \\        process();
+        \\        i += 1;
+        \\    }
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z024);
+    }
 }
