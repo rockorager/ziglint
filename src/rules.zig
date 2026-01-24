@@ -22,6 +22,7 @@ pub const Rule = enum(u16) {
     Z020 = 20,
     Z021 = 21,
     Z022 = 22,
+    Z023 = 23,
 
     pub fn code(self: Rule) []const u8 {
         return @tagName(self);
@@ -115,6 +116,11 @@ pub const Rule = enum(u16) {
             // @This() alias in anonymous/local struct should be Self
             .Z022 => {
                 try writer.print("{s}@This(){s} alias {s}'{s}'{s} should be {s}'Self'{s}", .{ b, r, y, context, r, y, r });
+            },
+            // missing defer after allocation
+            .Z023 => {
+                // context is the variable name; defer=blue, variable=yellow
+                try writer.print("missing {s}defer{s} after allocation of {s}'{s}'{s}", .{ b, r, y, context, r });
             },
         }
     }

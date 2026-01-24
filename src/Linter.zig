@@ -799,10 +799,22 @@ fn visitChildren(self: *Linter, node: Ast.Node.Index) void {
         .block, .block_semicolon => {
             var buf: [2]Ast.Node.Index = undefined;
             const stmts = self.tree.blockStatements(&buf, node) orelse return;
+            self.checkMissingDefer(stmts);
             for (stmts) |stmt| self.visitNode(stmt);
         },
         .block_two, .block_two_semicolon => {
             const data = self.tree.nodeData(node).opt_node_and_opt_node;
+            var stmts: [2]Ast.Node.Index = undefined;
+            var len: usize = 0;
+            if (data[0].unwrap()) |n| {
+                stmts[len] = n;
+                len += 1;
+            }
+            if (data[1].unwrap()) |n| {
+                stmts[len] = n;
+                len += 1;
+            }
+            self.checkMissingDefer(stmts[0..len]);
             if (data[0].unwrap()) |n| self.visitNode(n);
             if (data[1].unwrap()) |n| self.visitNode(n);
         },
@@ -1048,6 +1060,130 @@ fn containsDeprecated(text: []const u8) bool {
         const slice = text[i .. i + 10];
         if (std.ascii.eqlIgnoreCase(slice, "deprecated")) return true;
     }
+    return false;
+}
+
+fn checkMissingDefer(self: *Linter, stmts: []const Ast.Node.Index) void {
+    // Track allocations and whether they have a corresponding defer/errdefer
+    for (stmts, 0..) |stmt, i| {
+        const alloc_info = self.getAllocationInfo(stmt) orelse continue;
+
+        // Check subsequent statements for defer/errdefer freeing this variable
+        var has_defer = false;
+        for (stmts[i + 1 ..]) |next_stmt| {
+            if (self.isDeferFreeing(next_stmt, alloc_info.var_name)) {
+                has_defer = true;
+                break;
+            }
+        }
+
+        if (!has_defer) {
+            const loc = self.tree.tokenLocation(0, alloc_info.name_token);
+            self.report(loc, .Z023, alloc_info.var_name);
+        }
+    }
+}
+
+const AllocationInfo = struct {
+    var_name: []const u8,
+    name_token: Ast.TokenIndex,
+};
+
+fn getAllocationInfo(self: *Linter, node: Ast.Node.Index) ?AllocationInfo {
+    const tag = self.tree.nodeTag(node);
+
+    // Check for var declarations
+    if (tag != .simple_var_decl and tag != .aligned_var_decl and
+        tag != .local_var_decl and tag != .global_var_decl)
+    {
+        return null;
+    }
+
+    const var_decl = self.tree.fullVarDecl(node) orelse return null;
+    const init_node = var_decl.ast.init_node.unwrap() orelse return null;
+
+    // Check if init is a try expression
+    const try_payload = self.getTryPayload(init_node) orelse return null;
+
+    // Check if the try payload is an allocator call
+    if (!self.isAllocatorCall(try_payload)) return null;
+
+    const name_token = var_decl.ast.mut_token + 1;
+    const var_name = self.tree.tokenSlice(name_token);
+
+    return .{ .var_name = var_name, .name_token = name_token };
+}
+
+fn getTryPayload(self: *Linter, node: Ast.Node.Index) ?Ast.Node.Index {
+    const tag = self.tree.nodeTag(node);
+    if (tag != .@"try") return null;
+    return self.tree.nodeData(node).node;
+}
+
+fn isAllocatorCall(self: *Linter, node: Ast.Node.Index) bool {
+    var buf: [1]Ast.Node.Index = undefined;
+    const call = self.tree.fullCall(&buf, node) orelse return false;
+
+    const fn_expr = call.ast.fn_expr;
+    if (self.tree.nodeTag(fn_expr) != .field_access) return false;
+
+    const data = self.tree.nodeData(fn_expr).node_and_token;
+    const method_name = self.tree.tokenSlice(data[1]);
+
+    // Check for common allocator methods
+    return std.mem.eql(u8, method_name, "alloc") or
+        std.mem.eql(u8, method_name, "create") or
+        std.mem.eql(u8, method_name, "alignedAlloc") or
+        std.mem.eql(u8, method_name, "allocSentinel") or
+        std.mem.eql(u8, method_name, "dupe") or
+        std.mem.eql(u8, method_name, "dupeZ");
+}
+
+fn isDeferFreeing(self: *Linter, node: Ast.Node.Index, var_name: []const u8) bool {
+    const tag = self.tree.nodeTag(node);
+
+    // Check for defer or errdefer
+    if (tag != .@"defer" and tag != .@"errdefer") {
+        return false;
+    }
+
+    // Get the deferred expression
+    const payload = switch (tag) {
+        .@"defer" => self.tree.nodeData(node).node,
+        .@"errdefer" => self.tree.nodeData(node).opt_token_and_node[1],
+        else => return false,
+    };
+
+    // Check if it's a call that references our variable
+    return self.callReferencesVar(payload, var_name);
+}
+
+fn callReferencesVar(self: *Linter, node: Ast.Node.Index, var_name: []const u8) bool {
+    var buf: [1]Ast.Node.Index = undefined;
+    const call = self.tree.fullCall(&buf, node) orelse return false;
+
+    // Check call arguments for the variable name
+    for (call.ast.params) |param| {
+        if (self.nodeReferencesVar(param, var_name)) return true;
+    }
+
+    return false;
+}
+
+fn nodeReferencesVar(self: *Linter, node: Ast.Node.Index, var_name: []const u8) bool {
+    const tag = self.tree.nodeTag(node);
+
+    if (tag == .identifier) {
+        const name = self.tree.tokenSlice(self.tree.nodeMainToken(node));
+        return std.mem.eql(u8, name, var_name);
+    }
+
+    // For field_access like items.ptr, check the base
+    if (tag == .field_access) {
+        const data = self.tree.nodeData(node).node_and_token;
+        return self.nodeReferencesVar(data[0], var_name);
+    }
+
     return false;
 }
 
@@ -2241,6 +2377,25 @@ test "Z019: @This() in named struct should warn" {
     try std.testing.expect(found);
 }
 
+test "Z023: detect missing defer after alloc" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo(allocator: std.mem.Allocator) !void {
+        \\    const items = try allocator.alloc(u8, 100);
+        \\    _ = items;
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z023) {
+            found = true;
+            try std.testing.expectEqualStrings("items", d.context);
+        }
+    }
+    try std.testing.expect(found);
+}
+
 test "Z019: @This() in anonymous struct is ok" {
     var linter: Linter = .init(std.testing.allocator,
         \\fn Generic(comptime T: type) type {
@@ -2272,6 +2427,54 @@ test "Z019: nested named struct should warn" {
         if (d.rule == rules.Rule.Z019) {
             found = true;
             try std.testing.expectEqualStrings("Inner", d.context);
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "Z023: allow alloc with defer free" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo(allocator: std.mem.Allocator) !void {
+        \\    const items = try allocator.alloc(u8, 100);
+        \\    defer allocator.free(items);
+        \\    _ = items;
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z023);
+    }
+}
+
+test "Z023: allow alloc with errdefer free" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo(allocator: std.mem.Allocator) !void {
+        \\    const items = try allocator.alloc(u8, 100);
+        \\    errdefer allocator.free(items);
+        \\    _ = items;
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z023);
+    }
+}
+
+test "Z023: detect missing defer after create" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo(allocator: std.mem.Allocator) !void {
+        \\    const ptr = try allocator.create(Node);
+        \\    _ = ptr;
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z023) {
+            found = true;
         }
     }
     try std.testing.expect(found);
