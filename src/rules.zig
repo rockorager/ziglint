@@ -22,6 +22,7 @@ pub const Rule = enum(u16) {
     Z020 = 20,
     Z021 = 21,
     Z022 = 22,
+    Z026 = 26,
 
     pub fn code(self: Rule) []const u8 {
         return @tagName(self);
@@ -116,6 +117,8 @@ pub const Rule = enum(u16) {
             .Z022 => {
                 try writer.print("{s}@This(){s} alias {s}'{s}'{s} should be {s}'Self'{s}", .{ b, r, y, context, r, y, r });
             },
+            // division without explicit form
+            .Z026 => try writer.print("use {s}@divExact{s}{s},{s} {s}@divFloor{s}{s},{s} or {s}@divTrunc{s} for integer division", .{ b, r, d, r, b, r, d, r, b, r }),
         }
     }
 };

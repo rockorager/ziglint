@@ -774,6 +774,7 @@ fn visitNode(self: *Linter, node: Ast.Node.Index) void {
             self.checkDeprecatedCall(node);
             self.checkCompoundAssert(node);
         },
+        .div => self.checkDivisionOperator(node),
         else => {},
     }
 
@@ -805,6 +806,30 @@ fn visitChildren(self: *Linter, node: Ast.Node.Index) void {
             const data = self.tree.nodeData(node).opt_node_and_opt_node;
             if (data[0].unwrap()) |n| self.visitNode(n);
             if (data[1].unwrap()) |n| self.visitNode(n);
+        },
+        .@"return" => {
+            if (self.tree.nodeData(node).opt_node.unwrap()) |n| self.visitNode(n);
+        },
+        .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => {
+            const var_decl = self.tree.fullVarDecl(node) orelse return;
+            if (var_decl.ast.init_node.unwrap()) |n| self.visitNode(n);
+        },
+        .div,
+        .mul,
+        .add,
+        .sub,
+        .mod,
+        .bool_and,
+        .bool_or,
+        .assign,
+        .assign_add,
+        .assign_sub,
+        .assign_mul,
+        .assign_div,
+        => {
+            const data = self.tree.nodeData(node).node_and_node;
+            self.visitNode(data[0]);
+            self.visitNode(data[1]);
         },
         else => {},
     }
@@ -1077,6 +1102,12 @@ fn checkCompoundAssert(self: *Linter, node: Ast.Node.Index) void {
 
     const loc = self.tree.tokenLocation(0, self.tree.nodeMainToken(node));
     self.report(loc, .Z016, "and");
+}
+
+fn checkDivisionOperator(self: *Linter, node: Ast.Node.Index) void {
+    const main_token = self.tree.nodeMainToken(node);
+    const loc = self.tree.tokenLocation(0, main_token);
+    self.report(loc, .Z026, "");
 }
 
 fn checkRedundantType(self: *Linter, node: Ast.Node.Index, check_field_access: bool) void {
@@ -2415,4 +2446,75 @@ test "Z022: local struct @This() alias should be Self" {
         if (d.rule == rules.Rule.Z022) found = true;
     }
     try std.testing.expect(found);
+}
+
+test "Z026: detect division operator" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo(a: u32, b: u32) u32 {
+        \\    return a / b;
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z026) {
+            found = true;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "Z026: detect division with literals" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const result = 100 / 3;
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z026) {
+            found = true;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "Z026: @divExact is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo(a: u32, b: u32) u32 {
+        \\    return @divExact(a, b);
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z026);
+    }
+}
+
+test "Z026: @divFloor is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo(a: u32, b: u32) u32 {
+        \\    return @divFloor(a, b);
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z026);
+    }
+}
+
+test "Z026: @divTrunc is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo(a: u32, b: u32) u32 {
+        \\    return @divTrunc(a, b);
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z026);
+    }
 }
