@@ -1102,6 +1102,31 @@ fn visitChildren(self: *Linter, node: Ast.Node.Index) void {
             if (data[0].unwrap()) |n| self.visitNode(n);
             if (data[1].unwrap()) |n| self.visitNode(n);
         },
+        // Variable declarations - visit the init node (RHS) to recurse into struct/enum definitions
+        .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => {
+            const var_decl = self.tree.fullVarDecl(node) orelse return;
+            if (var_decl.ast.init_node.unwrap()) |init_node| self.visitNode(init_node);
+        },
+        // Container declarations (structs, enums, unions) - visit members
+        .container_decl,
+        .container_decl_trailing,
+        .container_decl_two,
+        .container_decl_two_trailing,
+        .container_decl_arg,
+        .container_decl_arg_trailing,
+        .tagged_union,
+        .tagged_union_trailing,
+        .tagged_union_two,
+        .tagged_union_two_trailing,
+        .tagged_union_enum_tag,
+        .tagged_union_enum_tag_trailing,
+        => {
+            var buf: [2]Ast.Node.Index = undefined;
+            const container = self.tree.fullContainerDecl(&buf, node) orelse return;
+            for (container.ast.members) |member| {
+                self.visitNode(member);
+            }
+        },
         else => {},
     }
 }
@@ -1461,16 +1486,14 @@ fn isExplicitStructInit(tag: Ast.Node.Tag) bool {
 
 fn isValidFunctionName(name: []const u8) bool {
     if (name.len == 0) return false;
+    // Must start with lowercase letter
     if (name[0] >= 'A' and name[0] <= 'Z') return false;
+    // Leading underscore is allowed (private/internal convention)
     if (name[0] == '_') return true;
 
+    // No underscores allowed in camelCase (except leading)
     for (name) |c| {
-        if (c == '_' and name.len > 1) {
-            const has_upper = for (name) |ch| {
-                if (ch >= 'A' and ch <= 'Z') break true;
-            } else false;
-            if (has_upper) return false;
-        }
+        if (c == '_') return false;
     }
 
     return true;
