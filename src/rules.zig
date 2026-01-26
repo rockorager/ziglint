@@ -22,6 +22,7 @@ pub const Rule = enum(u16) {
     Z020 = 20,
     Z021 = 21,
     Z022 = 22,
+    Z023 = 23,
 
     pub fn code(self: Rule) []const u8 {
         return @tagName(self);
@@ -115,6 +116,14 @@ pub const Rule = enum(u16) {
             // @This() alias in anonymous/local struct should be Self
             .Z022 => {
                 try writer.print("{s}@This(){s} alias {s}'{s}'{s} should be {s}'Self'{s}", .{ b, r, y, context, r, y, r });
+            },
+            // argument order: type params, Allocator, Io, then other args
+            // context is "current_kind\x00expected_before" format
+            .Z023 => {
+                const sep = std.mem.indexOfScalar(u8, context, 0) orelse context.len;
+                const current = context[0..sep];
+                const before = if (sep < context.len) context[sep + 1 ..] else "";
+                try writer.print("{s}'{s}'{s} parameter should come before {s}'{s}'{s}", .{ y, current, r, y, before, r });
             },
         }
     }

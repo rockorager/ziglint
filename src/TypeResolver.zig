@@ -533,6 +533,14 @@ fn resolveVarDeclWithName(self: *TypeResolver, tree: *const Ast, node: Ast.Node.
         if (isContainerDecl(init_tag)) {
             return .{ .user_type = .{ .module_path = module_path, .name = decl_name } };
         }
+        // Check for @This() - treat as a user type alias for the current module
+        if (init_tag == .builtin_call_two or init_tag == .builtin_call_two_comma) {
+            const main_token = tree.nodeMainToken(init_node);
+            const builtin_name = tree.tokenSlice(main_token);
+            if (std.mem.eql(u8, builtin_name, "@This")) {
+                return .{ .user_type = .{ .module_path = module_path, .name = decl_name } };
+            }
+        }
         return self.resolveNodeType(tree, init_node, module_path);
     }
 

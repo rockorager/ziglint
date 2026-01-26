@@ -727,6 +727,218 @@ fn isBuiltinType(name: []const u8) bool {
     return false;
 }
 
+const ParamKind = enum {
+    type_param,
+    allocator,
+    io,
+    other,
+
+    fn order(self: ParamKind) u8 {
+        return switch (self) {
+            .type_param => 0,
+            .allocator => 1,
+            .io => 2,
+            .other => 3,
+        };
+    }
+
+    fn name(self: ParamKind) []const u8 {
+        return switch (self) {
+            .type_param => "type",
+            .allocator => "Allocator",
+            .io => "Io",
+            .other => "other",
+        };
+    }
+};
+
+fn checkArgumentOrder(self: *Linter, node: Ast.Node.Index) void {
+    var buf: [1]Ast.Node.Index = undefined;
+    const fn_proto = self.tree.fullFnProto(&buf, node) orelse return;
+
+    var max_order: u8 = 0;
+    var max_kind: ParamKind = .type_param;
+    var max_token: Ast.TokenIndex = 0;
+    var is_first = true;
+
+    var it = fn_proto.iterate(&self.tree);
+    while (it.next()) |param| {
+        // Skip first param if it's a receiver (type refers to @This() or container type)
+        if (is_first) {
+            is_first = false;
+            if (self.isReceiverParam(param)) continue;
+        }
+
+        const kind = self.classifyParam(param);
+        const current_order = kind.order();
+
+        if (current_order < max_order) {
+            // This parameter is out of order
+            const token = param.name_token orelse
+                (if (param.type_expr) |te| self.tree.nodeMainToken(te) else continue);
+            const loc = self.tree.tokenLocation(0, token);
+
+            const context = std.fmt.allocPrint(self.allocator, "{s}\x00{s}", .{
+                kind.name(),
+                max_kind.name(),
+            }) catch continue;
+            self.allocated_contexts.append(self.allocator, context) catch {};
+            self.report(loc, .Z023, context);
+        }
+
+        if (current_order >= max_order) {
+            max_order = current_order;
+            max_kind = kind;
+            max_token = param.name_token orelse max_token;
+        }
+    }
+}
+
+fn classifyParam(self: *Linter, param: Ast.full.FnProto.Param) ParamKind {
+    const type_node = param.type_expr orelse return .other;
+    return self.classifyTypeNode(type_node);
+}
+
+fn isReceiverParam(self: *Linter, param: Ast.full.FnProto.Param) bool {
+    const type_node = param.type_expr orelse return false;
+
+    // Use TypeResolver if available for accurate type resolution
+    if (self.type_resolver) |resolver| {
+        if (self.module_path) |mod_path| {
+            const inner_node = self.unwrapPointerType(type_node);
+            const type_info = resolver.typeOf(mod_path, inner_node);
+            if (type_info == .user_type) {
+                // Check if the type's module matches current module (file-as-struct or local struct)
+                if (std.mem.eql(u8, type_info.user_type.module_path, mod_path)) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Fallback: check for @This() or Self
+    return self.typeRefersToThis(type_node);
+}
+
+fn unwrapPointerType(self: *Linter, node: Ast.Node.Index) Ast.Node.Index {
+    const tag = self.tree.nodeTag(node);
+    return switch (tag) {
+        .ptr_type_aligned, .ptr_type_sentinel, .ptr_type, .ptr_type_bit_range => blk: {
+            const ptr_type = self.tree.fullPtrType(node) orelse break :blk node;
+            break :blk self.unwrapPointerType(ptr_type.ast.child_type);
+        },
+        else => node,
+    };
+}
+
+fn typeRefersToThis(self: *Linter, node: Ast.Node.Index) bool {
+    const tag = self.tree.nodeTag(node);
+    return switch (tag) {
+        .builtin_call_two => blk: {
+            const main_token = self.tree.nodeMainToken(node);
+            const builtin_name = self.tree.tokenSlice(main_token);
+            break :blk std.mem.eql(u8, builtin_name, "@This");
+        },
+        .ptr_type_aligned, .ptr_type_sentinel, .ptr_type, .ptr_type_bit_range => blk: {
+            const ptr_type = self.tree.fullPtrType(node) orelse break :blk false;
+            break :blk self.typeRefersToThis(ptr_type.ast.child_type);
+        },
+        .identifier => blk: {
+            const name = self.tree.tokenSlice(self.tree.nodeMainToken(node));
+            break :blk std.mem.eql(u8, name, "Self");
+        },
+        else => false,
+    };
+}
+
+fn classifyTypeNode(self: *Linter, type_node: Ast.Node.Index) ParamKind {
+    // Check for `type` (comptime type parameter)
+    if (self.tree.nodeTag(type_node) == .identifier) {
+        const type_name = self.tree.tokenSlice(self.tree.nodeMainToken(type_node));
+        if (std.mem.eql(u8, type_name, "type")) return .type_param;
+    }
+
+    // Use TypeResolver for semantic type resolution (handles aliases)
+    if (self.type_resolver) |resolver| {
+        if (self.module_path) |mod_path| {
+            const type_info = resolver.typeOf(mod_path, type_node);
+            if (type_info == .std_type) {
+                return self.classifyPath(type_info.std_type.path);
+            }
+        }
+    }
+
+    // Fallback: check for field access chains like std.mem.Allocator or std.Io
+    const path = self.getFieldAccessPath(type_node) orelse return .other;
+    return self.classifyPath(path);
+}
+
+fn classifyPath(self: *Linter, path: []const u8) ParamKind {
+    _ = self;
+    if (std.mem.eql(u8, path, "std.mem.Allocator") or
+        std.mem.eql(u8, path, "mem.Allocator") or
+        std.mem.eql(u8, path, "Allocator"))
+    {
+        return .allocator;
+    }
+
+    if (std.mem.eql(u8, path, "std.Io") or
+        std.mem.eql(u8, path, "Io"))
+    {
+        return .io;
+    }
+
+    return .other;
+}
+
+fn getFieldAccessPath(self: *Linter, node: Ast.Node.Index) ?[]const u8 {
+    var parts: [8][]const u8 = undefined;
+    var count: usize = 0;
+
+    var current = node;
+    while (true) {
+        const tag = self.tree.nodeTag(current);
+        if (tag == .field_access) {
+            const data = self.tree.nodeData(current).node_and_token;
+            if (count < parts.len) {
+                parts[parts.len - 1 - count] = self.tree.tokenSlice(data[1]);
+                count += 1;
+            }
+            current = data[0];
+        } else if (tag == .identifier) {
+            if (count < parts.len) {
+                parts[parts.len - 1 - count] = self.tree.tokenSlice(self.tree.nodeMainToken(current));
+                count += 1;
+            }
+            break;
+        } else {
+            return null;
+        }
+    }
+
+    if (count == 0) return null;
+
+    // Build the path string
+    var total_len: usize = 0;
+    for (parts[parts.len - count ..]) |p| {
+        total_len += p.len + 1;
+    }
+
+    const result = self.allocator.alloc(u8, total_len - 1) catch return null;
+    var pos: usize = 0;
+    for (parts[parts.len - count ..], 0..) |p, i| {
+        if (i > 0) {
+            result[pos] = '.';
+            pos += 1;
+        }
+        @memcpy(result[pos..][0..p.len], p);
+        pos += p.len;
+    }
+
+    self.allocated_contexts.append(self.allocator, result) catch {};
+    return result;
+}
+
 fn checkExposedPrivateType(self: *Linter, node: Ast.Node.Index) void {
     var buf: [1]Ast.Node.Index = undefined;
     const fn_proto = self.tree.fullFnProto(&buf, node) orelse return;
@@ -894,6 +1106,7 @@ fn checkFnDecl(self: *Linter, node: Ast.Node.Index) void {
     }
 
     self.checkExposedPrivateType(node);
+    self.checkArgumentOrder(node);
 }
 
 fn checkVarDecl(self: *Linter, node: Ast.Node.Index) void {
@@ -2526,4 +2739,244 @@ test "Z022: local struct @This() alias should be Self" {
         if (d.rule == rules.Rule.Z022) found = true;
     }
     try std.testing.expect(found);
+}
+
+test "Z023: argument order - allocator before type param" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn bad(allocator: std.mem.Allocator, comptime T: type) void {
+        \\    _ = .{ allocator, T };
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z023) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "Z023: argument order - io before allocator" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn bad(io: std.Io, allocator: std.mem.Allocator) void {
+        \\    _ = .{ io, allocator };
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z023) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "Z023: argument order - correct order is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn good(comptime T: type, allocator: std.mem.Allocator, io: std.Io, value: u32) void {
+        \\    _ = .{ T, allocator, io, value };
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z023);
+    }
+}
+
+test "Z023: argument order - aliased Allocator" {
+    const source =
+        \\const std = @import("std");
+        \\const Alloc = std.mem.Allocator;
+        \\fn bad(value: u32, alloc: Alloc) void {
+        \\    _ = .{ value, alloc };
+        \\}
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try @import("ModuleGraph.zig").init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    var linter: Linter = .initWithSemantics(std.testing.allocator, source, path, &resolver, path);
+    defer linter.deinit();
+    linter.lint();
+
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z023) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "Z023: argument order - aliased Io" {
+    const source =
+        \\const std = @import("std");
+        \\const MyIo = std.Io;
+        \\fn bad(value: u32, io: MyIo) void {
+        \\    _ = .{ value, io };
+        \\}
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try @import("ModuleGraph.zig").init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    var linter: Linter = .initWithSemantics(std.testing.allocator, source, path, &resolver, path);
+    defer linter.deinit();
+    linter.lint();
+
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z023) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "Z023: receiver param with @This() is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const Foo = struct {
+        \\    pub fn bar(self: *@This(), alloc: std.mem.Allocator) void {
+        \\        _ = .{ self, alloc };
+        \\    }
+        \\};
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z023);
+    }
+}
+
+test "Z023: receiver param with Self is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const Foo = struct {
+        \\    const Self = @This();
+        \\    pub fn bar(self: *Self, alloc: std.mem.Allocator) void {
+        \\        _ = .{ self, alloc };
+        \\    }
+        \\};
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z023);
+    }
+}
+
+test "Z023: receiver param with struct name is ok (semantic)" {
+    const source =
+        \\const std = @import("std");
+        \\const Foo = struct {
+        \\    pub fn bar(self: *Foo, alloc: std.mem.Allocator) void {
+        \\        _ = .{ self, alloc };
+        \\    }
+        \\};
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try @import("ModuleGraph.zig").init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    var linter: Linter = .initWithSemantics(std.testing.allocator, source, path, &resolver, path);
+    defer linter.deinit();
+    linter.lint();
+
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z023);
+    }
+}
+
+test "Z023: file-as-struct receiver is ok (semantic)" {
+    const source =
+        \\const std = @import("std");
+        \\const Terminal = @This();
+        \\pub fn deinit(self: *Terminal, alloc: std.mem.Allocator) void {
+        \\    _ = .{ self, alloc };
+        \\}
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "Terminal.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "Terminal.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try @import("ModuleGraph.zig").init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    var linter: Linter = .initWithSemantics(std.testing.allocator, source, path, &resolver, path);
+    defer linter.deinit();
+    linter.lint();
+
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z023);
+    }
+}
+
+test "Z023: non-receiver first param still checked" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn bad(value: u32, alloc: std.mem.Allocator) void {
+        \\    _ = .{ value, alloc };
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z023) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "Z023: multiple violations reported" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn bad(io: std.Io, comptime T: type, alloc: std.mem.Allocator) void {
+        \\    _ = .{ io, T, alloc };
+        \\}
+    , "test.zig");
+    defer linter.deinit();
+    linter.lint();
+    var count: usize = 0;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z023) count += 1;
+    }
+    try std.testing.expect(count >= 2);
 }
