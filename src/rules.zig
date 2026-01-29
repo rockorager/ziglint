@@ -1,5 +1,7 @@
 //! Lint rule definitions with unique identifiers.
 
+const std = @import("std");
+
 pub const Rule = enum(u16) {
     Z001 = 1,
     Z002 = 2,
@@ -23,6 +25,43 @@ pub const Rule = enum(u16) {
     Z021 = 21,
     Z022 = 22,
     Z023 = 23,
+    Z024 = 24,
+
+    /// Returns the config struct type for this rule.
+    /// All config types have `enabled: bool` (default varies per rule).
+    /// Some rules have additional fields (e.g., Z024 has max_length).
+    fn ConfigType(comptime self: Rule) type {
+        const DefaultConfig = RuleConfig(true, struct {});
+        return switch (self) {
+            .Z024 => RuleConfig(true, struct { max_length: u32 = 120 }),
+            else => DefaultConfig,
+        };
+    }
+
+    pub const Config = blk: {
+        const enum_fields = @typeInfo(Rule).@"enum".fields;
+        var struct_fields: [enum_fields.len]std.builtin.Type.StructField = undefined;
+        for (enum_fields, 0..) |field, i| {
+            const rule: Rule = @enumFromInt(field.value);
+            const ConfigT = rule.ConfigType();
+            const default_value: ConfigT = .{};
+            struct_fields[i] = .{
+                .name = field.name,
+                .type = ConfigT,
+                .default_value_ptr = @ptrCast(&default_value),
+                .is_comptime = false,
+                .alignment = @alignOf(ConfigT),
+            };
+        }
+        break :blk @Type(.{
+            .@"struct" = .{
+                .layout = .auto,
+                .fields = &struct_fields,
+                .decls = &.{},
+                .is_tuple = false,
+            },
+        });
+    };
 
     pub fn code(self: Rule) []const u8 {
         return @tagName(self);
@@ -125,11 +164,17 @@ pub const Rule = enum(u16) {
                 const before = if (sep < context.len) context[sep + 1 ..] else "";
                 try writer.print("{s}'{s}'{s} parameter should come before {s}'{s}'{s}", .{ y, current, r, y, before, r });
             },
+            // line length exceeds limit
+            // context is "actual_len\x00max_len" format
+            .Z024 => {
+                const sep = std.mem.indexOfScalar(u8, context, 0) orelse context.len;
+                const actual = context[0..sep];
+                const max = if (sep < context.len) context[sep + 1 ..] else "120";
+                try writer.print("line exceeds {s}{s}{s} characters ({s}{s}{s} chars)", .{ y, max, r, y, actual, r });
+            },
         }
     }
 };
-
-const std = @import("std");
 
 fn writeHighlightedStructInit(writer: *std.Io.Writer, code: []const u8, type_color: []const u8, dim: []const u8, reset: []const u8) !void {
     const yellow = "\x1b[33m";
@@ -190,6 +235,36 @@ fn writeHighlightedStructInit(writer: *std.Io.Writer, code: []const u8, type_col
     if (is_truncated) {
         try writer.print("{s}...}}{s}", .{ dim, reset });
     }
+}
+
+/// Generates a config struct with `enabled: bool` plus any extra fields.
+// ziglint-ignore: Z023
+fn RuleConfig(comptime enabled_by_default: bool, comptime Extra: type) type {
+    const extra_fields = @typeInfo(Extra).@"struct".fields;
+
+    var fields: [1 + extra_fields.len]std.builtin.Type.StructField = undefined;
+
+    const default_enabled: bool = enabled_by_default;
+    fields[0] = .{
+        .name = "enabled",
+        .type = bool,
+        .default_value_ptr = @ptrCast(&default_enabled),
+        .is_comptime = false,
+        .alignment = @alignOf(bool),
+    };
+
+    for (extra_fields, 0..) |f, i| {
+        fields[1 + i] = f;
+    }
+
+    return @Type(.{
+        .@"struct" = .{
+            .layout = .auto,
+            .fields = &fields,
+            .decls = &.{},
+            .is_tuple = false,
+        },
+    });
 }
 
 test "rule codes" {

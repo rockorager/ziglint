@@ -5,14 +5,17 @@ A linter for Zig source code.
 ## Usage
 
 ```
-ziglint [options] <paths...>
+ziglint [options] [paths...]
 ```
+
+When run without arguments, ziglint looks for a `.ziglint.zon` config file and uses the paths specified there, or defaults to the current directory.
 
 Directories are scanned recursively for `.zig` files.
 
 ### Options
 
 - `--zig-lib-path <path>` - Override the path to the Zig standard library (auto-detected from `zig env` if not specified)
+- `--ignore <rule>` - Ignore a rule (e.g., `Z001`). Can be repeated.
 - `-h, --help` - Show help message
 
 ## Rules
@@ -40,3 +43,39 @@ Directories are scanned recursively for `.zig` files.
 | Z020 | Inline `@This()`; assign to a constant first |
 | Z021 | File-struct `@This()` alias should match filename |
 | Z022 | `@This()` alias in anonymous/local struct should be `Self` |
+| Z023 | Parameter order: comptime before runtime, pointers before values |
+| Z024 | Line exceeds maximum length (default: 120) |
+
+## Configuration
+
+Create a `.ziglint.zon` file in your project root to configure ziglint:
+
+```zig
+.{
+    // Paths to lint (default: current directory)
+    .paths = .{
+        "src",
+        "build.zig",
+    },
+
+    // Per-rule configuration
+    .rules = .{
+        // Disable a rule entirely
+        .Z001 = .{ .enabled = false },
+
+        // Configure rule-specific settings
+        .Z024 = .{ .max_length = 80 },
+    },
+}
+```
+
+### Inline Ignores
+
+You can ignore specific rules on a per-line basis using comments:
+
+```zig
+fn MyBadName() void {} // ziglint-ignore: Z001
+
+// ziglint-ignore: Z001
+fn AnotherBadName() void {}
+```

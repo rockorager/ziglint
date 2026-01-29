@@ -74,13 +74,13 @@ pub fn addLint(
     const run = b.addRunArtifact(exe);
     for (paths) |path| {
         run.addDirectoryArg(path);
-        addPathInputs(run, path);
+        addPathInputs(b, run, path);
     }
     run.expectExitCode(0);
     return &run.step;
 }
 
-fn addPathInputs(run: *std.Build.Step.Run, lazy_path: std.Build.LazyPath) void {
+fn addPathInputs(b: *std.Build, run: *std.Build.Step.Run, lazy_path: std.Build.LazyPath) void {
     // Only handle src_path (from b.path()) - other variants may not be resolved yet
     const src = switch (lazy_path) {
         .src_path => |src| src,
@@ -94,7 +94,7 @@ fn addPathInputs(run: *std.Build.Step.Run, lazy_path: std.Build.LazyPath) void {
     if (stat.kind == .directory) {
         var dir = std.fs.cwd().openDir(full_path, .{ .iterate = true }) catch return;
         defer dir.close();
-        var walker = dir.walk(std.heap.page_allocator) catch return;
+        var walker = dir.walk(b.allocator) catch return;
         defer walker.deinit();
         while (walker.next() catch null) |entry| {
             if (entry.kind == .file and std.mem.endsWith(u8, entry.basename, ".zig")) {
