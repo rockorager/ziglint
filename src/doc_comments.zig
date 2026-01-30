@@ -14,7 +14,7 @@ pub fn getDocComment(allocator: std.mem.Allocator, tree: *const Ast, node: Ast.N
     if (first_token == 0) return null;
 
     // Walk backwards from the first token to find doc comments
-    var doc_tokens: std.ArrayListUnmanaged(Ast.TokenIndex) = .empty;
+    var doc_tokens: std.ArrayList(Ast.TokenIndex) = .empty;
     defer doc_tokens.deinit(allocator);
 
     var token = first_token - 1;
@@ -36,7 +36,7 @@ pub fn getDocComment(allocator: std.mem.Allocator, tree: *const Ast, node: Ast.N
     std.mem.reverse(Ast.TokenIndex, doc_tokens.items);
 
     // Build the combined doc comment text
-    var result: std.ArrayListUnmanaged(u8) = .empty;
+    var result: std.ArrayList(u8) = .empty;
     errdefer result.deinit(allocator);
 
     for (doc_tokens.items, 0..) |doc_token, i| {

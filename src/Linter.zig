@@ -13,12 +13,12 @@ allocator: std.mem.Allocator,
 source: [:0]const u8,
 path: []const u8,
 tree: Ast,
-diagnostics: std.ArrayListUnmanaged(Diagnostic),
+diagnostics: std.ArrayList(Diagnostic),
 seen_imports: std.StringHashMapUnmanaged(Ast.TokenIndex),
 type_resolver: ?*TypeResolver = null,
 module_path: ?[]const u8 = null,
 config: *const Config = &default_config,
-allocated_contexts: std.ArrayListUnmanaged([]const u8) = .empty,
+allocated_contexts: std.ArrayList([]const u8) = .empty,
 public_types: std.StringHashMapUnmanaged(void) = .empty,
 imported_types: std.StringHashMapUnmanaged(void) = .empty,
 import_bindings: std.StringHashMapUnmanaged(ImportInfo) = .empty,
@@ -1153,9 +1153,11 @@ fn visitChildren(self: *Linter, node: Ast.Node.Index) void {
             self.visitNode(data[0]);
             self.visitNode(data[1]);
         },
-        // Variable declarations - visit the init node (RHS) to recurse into struct/enum definitions
+        // Variable declarations - visit both type annotation and init node
         .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => {
             const var_decl = self.tree.fullVarDecl(node) orelse return;
+            // Visit type annotation (e.g., for `var x: std.ArrayListUnmanaged(u8)` to catch deprecated calls)
+            if (var_decl.ast.type_node.unwrap()) |type_node| self.visitNode(type_node);
             if (var_decl.ast.init_node.unwrap()) |init_node| self.visitNode(init_node);
         },
         // Container declarations (structs, enums, unions) - visit members
@@ -1692,6 +1694,7 @@ fn checkDeprecatedCall(self: *Linter, node: Ast.Node.Index) void {
     const fn_expr_tag = self.tree.nodeTag(fn_expr);
 
     var method_def: ?TypeResolver.MethodDef = null;
+    var stdlib_decl: ?TypeResolver.MethodDef = null;
     var name_token: Ast.TokenIndex = undefined;
     var fn_name: []const u8 = undefined;
 
@@ -1703,6 +1706,12 @@ fn checkDeprecatedCall(self: *Linter, node: Ast.Node.Index) void {
 
         const receiver_type = resolver.typeOf(mod_path, receiver_node);
         method_def = resolver.findMethodDef(receiver_type, fn_name);
+
+        // For stdlib types, also get the declaration without following aliases
+        // (the alias itself may be deprecated, like std.ArrayListUnmanaged)
+        if (receiver_type == .std_type) {
+            stdlib_decl = resolver.findStdlibDecl(receiver_type.std_type.path, fn_name);
+        }
     } else if (fn_expr_tag == .identifier) {
         // Direct function call in the same module (e.g., `DeprecatedFunc()`)
         name_token = self.tree.nodeMainToken(fn_expr);
@@ -1714,22 +1723,34 @@ fn checkDeprecatedCall(self: *Linter, node: Ast.Node.Index) void {
         return;
     }
 
-    const def = method_def orelse return;
+    // Check the target definition for deprecation
+    if (method_def) |def| {
+        if (self.checkDefDeprecation(def, name_token, fn_name)) return;
+    }
 
-    const mod = resolver.graph.getModule(def.module_path) orelse return;
-    const doc = doc_comments.getDocComment(self.allocator, &mod.tree, def.node) orelse return;
+    // Also check the stdlib declaration itself (for deprecated aliases like std.ArrayListUnmanaged)
+    if (stdlib_decl) |decl| {
+        _ = self.checkDefDeprecation(decl, name_token, fn_name);
+    }
+}
+
+fn checkDefDeprecation(self: *Linter, def: TypeResolver.MethodDef, name_token: Ast.TokenIndex, fn_name: []const u8) bool {
+    const resolver = self.type_resolver orelse return false;
+    const mod = resolver.graph.getModule(def.module_path) orelse return false;
+    const doc = doc_comments.getDocComment(self.allocator, &mod.tree, def.node) orelse return false;
     defer self.allocator.free(doc);
 
     if (containsDeprecated(doc)) {
         const loc = self.tree.tokenLocation(0, name_token);
-        // Build message with doc comment
-        const msg = std.fmt.allocPrint(self.allocator, "'{s}' is deprecated: {s}", .{ fn_name, doc }) catch return;
+        const msg = std.fmt.allocPrint(self.allocator, "'{s}' is deprecated: {s}", .{ fn_name, doc }) catch return false;
         self.allocated_contexts.append(self.allocator, msg) catch {
             self.allocator.free(msg);
-            return;
+            return false;
         };
         self.report(loc, .Z011, msg);
+        return true;
     }
+    return false;
 }
 
 fn containsDeprecated(text: []const u8) bool {
@@ -2933,6 +2954,73 @@ test "Z011: detect deprecated type function alias" {
     defer std.testing.allocator.free(path);
 
     var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    var linter: Linter = .initWithSemantics(std.testing.allocator, source, path, &resolver, path, null);
+    defer linter.deinit();
+
+    linter.lint();
+
+    var found_z011 = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z011) {
+            found_z011 = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_z011);
+}
+
+test "Z011: detect deprecated stdlib function (ArrayListUnmanaged)" {
+    const ModuleGraph = @import("ModuleGraph.zig");
+
+    // Detect zig lib path by running zig env
+    const zig_lib_path = blk: {
+        var child: std.process.Child = .init(&.{ "zig", "env" }, std.testing.allocator);
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Ignore;
+        child.spawn() catch break :blk null;
+
+        var buf: [64 * 1024]u8 = undefined;
+        const stdout = child.stdout orelse break :blk null;
+        const len = stdout.readAll(&buf) catch break :blk null;
+        const output = buf[0..len];
+
+        const term = child.wait() catch break :blk null;
+        switch (term) {
+            .Exited => |code| if (code != 0) break :blk null,
+            else => break :blk null,
+        }
+
+        const needle = ".lib_dir = \"";
+        const start_idx = std.mem.indexOf(u8, output, needle) orelse break :blk null;
+        const value_start = start_idx + needle.len;
+        const end_idx = std.mem.indexOfPos(u8, output, value_start, "\"") orelse break :blk null;
+        break :blk std.testing.allocator.dupe(u8, output[value_start..end_idx]) catch null;
+    };
+
+    // Skip test if zig isn't available
+    if (zig_lib_path == null) return;
+    defer std.testing.allocator.free(zig_lib_path.?);
+
+    const source =
+        \\const std = @import("std");
+        \\pub fn main() void {
+        \\    _ = std.ArrayListUnmanaged(u8);
+        \\}
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, zig_lib_path);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);

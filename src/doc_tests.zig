@@ -25,7 +25,7 @@ const ParsedDoc = struct {
 
 /// Parses a markdown file and extracts code blocks with their expectations.
 fn parseMarkdown(allocator: std.mem.Allocator, content: []const u8) !ParsedDoc {
-    var tests: std.ArrayListUnmanaged(DocTest) = .empty;
+    var tests: std.ArrayList(DocTest) = .empty;
     var rule: ?rules.Rule = null;
 
     // Parse frontmatter for rule identifier
@@ -57,7 +57,7 @@ fn parseMarkdown(allocator: std.mem.Allocator, content: []const u8) !ParsedDoc {
             const code = content[code_start..end];
 
             // Parse expected rules from `// expect: ZXXX` comments
-            var expected: std.ArrayListUnmanaged(rules.Rule) = .empty;
+            var expected: std.ArrayList(rules.Rule) = .empty;
             var code_lines = std.mem.splitScalar(u8, code, '\n');
             while (code_lines.next()) |code_line| {
                 if (std.mem.indexOf(u8, code_line, "// expect:")) |expect_pos| {

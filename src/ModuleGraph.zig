@@ -105,7 +105,7 @@ fn addModule(self: *ModuleGraph, path: []const u8) !void {
 }
 
 fn extractImports(self: *ModuleGraph, tree: *const Ast, module_path: []const u8) ![][]const u8 {
-    var imports: std.ArrayListUnmanaged([]const u8) = .empty;
+    var imports: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (imports.items) |p| self.allocator.free(p);
         imports.deinit(self.allocator);
@@ -123,7 +123,7 @@ fn collectImportsFromNode(
     tree: *const Ast,
     node: Ast.Node.Index,
     module_path: []const u8,
-    imports: *std.ArrayListUnmanaged([]const u8),
+    imports: *std.ArrayList([]const u8),
 ) !void {
     const tag = tree.nodeTag(node);
 
@@ -157,7 +157,7 @@ fn checkForImport(
     tree: *const Ast,
     node: Ast.Node.Index,
     module_path: []const u8,
-    imports: *std.ArrayListUnmanaged([]const u8),
+    imports: *std.ArrayList([]const u8),
 ) !void {
     const tag = tree.nodeTag(node);
     if (tag != .builtin_call_two and tag != .builtin_call_two_comma and

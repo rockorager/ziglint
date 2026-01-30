@@ -113,8 +113,8 @@ fn parseArgs(allocator: std.mem.Allocator, writer: *std.Io.Writer) !Config {
     const args = try std.process.argsAlloc(allocator);
 
     var config: Config = .{};
-    var paths: std.ArrayListUnmanaged([]const u8) = .empty;
-    var ignored_rules: std.ArrayListUnmanaged(rules.Rule) = .empty;
+    var paths: std.ArrayList([]const u8) = .empty;
+    var ignored_rules: std.ArrayList(rules.Rule) = .empty;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -222,7 +222,7 @@ fn lintDirectory(allocator: std.mem.Allocator, path: []const u8, zig_lib_path: ?
     defer if (gitignore) |g| allocator.free(g);
 
     // Collect all .zig files first
-    var files: std.ArrayListUnmanaged([]const u8) = .empty;
+    var files: std.ArrayList([]const u8) = .empty;
     defer {
         for (files.items) |f| allocator.free(f);
         files.deinit(allocator);

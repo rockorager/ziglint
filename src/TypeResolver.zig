@@ -12,7 +12,7 @@ const ModuleGraph = @import("ModuleGraph.zig");
 const TypeResolver = @This();
 
 allocator: std.mem.Allocator,
-graph: *const ModuleGraph,
+graph: *ModuleGraph,
 
 pub const TypeInfo = union(enum) {
     /// A primitive type like u32, bool, void
@@ -149,7 +149,7 @@ pub const TypeInfo = union(enum) {
     }
 };
 
-pub fn init(allocator: std.mem.Allocator, graph: *const ModuleGraph) TypeResolver {
+pub fn init(allocator: std.mem.Allocator, graph: *ModuleGraph) TypeResolver {
     return .{
         .allocator = allocator,
         .graph = graph,
@@ -193,6 +193,90 @@ pub fn findMethodDef(self: *TypeResolver, receiver_type: TypeInfo, method_name: 
 /// Handles both direct function declarations and const aliases to functions.
 pub fn findFnInCurrentModule(self: *TypeResolver, module_path: []const u8, fn_name: []const u8) ?MethodDef {
     return self.findMethodInFileAsStruct(module_path, fn_name);
+}
+
+/// Finds the declaration node for a name in stdlib without following aliases.
+/// Used for deprecation checking where the alias itself may be deprecated.
+pub fn findStdlibDecl(self: *TypeResolver, path: []const u8, name: []const u8) ?MethodDef {
+    const lib_path = self.graph.zig_lib_path orelse return null;
+
+    const std_path = std.fs.path.join(self.allocator, &.{ lib_path, "std", "std.zig" }) catch return null;
+    defer self.allocator.free(std_path);
+
+    // For empty path, look directly in std.zig
+    if (path.len == 0) {
+        self.graph.addModulePublic(std_path);
+        const mod = self.graph.getModule(std_path) orelse return null;
+        return self.findDeclNodeByName(&mod.tree, name, mod.path);
+    }
+
+    // For non-empty paths, follow the path but don't follow the final alias
+    var components = std.mem.splitScalar(u8, path, '.');
+    var current_module_path: []const u8 = std_path;
+    var owns_path = false;
+    defer if (owns_path) self.allocator.free(current_module_path);
+
+    while (components.next()) |component| {
+        self.graph.addModulePublic(current_module_path);
+        const mod = self.graph.getModule(current_module_path) orelse return null;
+        const tree = &mod.tree;
+
+        if (self.findDeclInModule(tree, component, current_module_path)) |result| {
+            switch (result) {
+                .import_path => |imported| {
+                    if (owns_path) self.allocator.free(current_module_path);
+                    current_module_path = imported;
+                    owns_path = true;
+                },
+                .type_node => break,
+            }
+        } else {
+            return null;
+        }
+    }
+
+    self.graph.addModulePublic(current_module_path);
+    const mod = self.graph.getModule(current_module_path) orelse return null;
+    return self.findDeclNodeByName(&mod.tree, name, mod.path);
+}
+
+/// Finds a declaration node by name without following aliases.
+fn findDeclNodeByName(self: *TypeResolver, tree: *const Ast, name: []const u8, module_path: []const u8) ?MethodDef {
+    _ = self;
+    for (tree.rootDecls()) |decl| {
+        const tag = tree.nodeTag(decl);
+        if (tag == .fn_decl) {
+            var buf: [1]Ast.Node.Index = undefined;
+            const fn_proto = tree.fullFnProto(&buf, decl) orelse continue;
+            const fn_name_token = fn_proto.name_token orelse continue;
+            if (std.mem.eql(u8, tree.tokenSlice(fn_name_token), name)) {
+                const loc = tree.tokenLocation(0, fn_name_token);
+                return .{
+                    .module_path = module_path,
+                    .node = decl,
+                    .name_token = fn_name_token,
+                    .line = @intCast(loc.line),
+                    .column = @intCast(loc.column),
+                };
+            }
+        } else if (tag == .simple_var_decl or tag == .aligned_var_decl or
+            tag == .local_var_decl or tag == .global_var_decl)
+        {
+            const var_decl = tree.fullVarDecl(decl) orelse continue;
+            const name_token = var_decl.ast.mut_token + 1;
+            if (std.mem.eql(u8, tree.tokenSlice(name_token), name)) {
+                const loc = tree.tokenLocation(0, name_token);
+                return .{
+                    .module_path = module_path,
+                    .node = decl,
+                    .name_token = name_token,
+                    .line = @intCast(loc.line),
+                    .column = @intCast(loc.column),
+                };
+            }
+        }
+    }
+    return null;
 }
 
 /// Returns true if the given node evaluates to a type rather than an instance.
@@ -272,6 +356,11 @@ fn findMethodInStdlib(self: *TypeResolver, path: []const u8, method_name: []cons
     const std_path = std.fs.path.join(self.allocator, &.{ lib_path, "std", "std.zig" }) catch return null;
     defer self.allocator.free(std_path);
 
+    // For empty path (direct std.X access), look in std.zig directly
+    if (path.len == 0) {
+        return self.findMethodInFileAsStruct(std_path, method_name);
+    }
+
     // Split path into components (e.g., "fs.File" -> ["fs", "File"])
     var components = std.mem.splitScalar(u8, path, '.');
     var current_module_path: []const u8 = std_path;
@@ -281,6 +370,8 @@ fn findMethodInStdlib(self: *TypeResolver, path: []const u8, method_name: []cons
     var type_name: ?[]const u8 = null;
 
     while (components.next()) |component| {
+        // Lazy-load stdlib modules on demand
+        self.graph.addModulePublic(current_module_path);
         const mod = self.graph.getModule(current_module_path) orelse return null;
         const tree = &mod.tree;
 
@@ -371,6 +462,7 @@ fn findDeclInModule(self: *TypeResolver, tree: *const Ast, name: []const u8, mod
 }
 
 fn findMethodInModule(self: *TypeResolver, module_path: []const u8, type_name: []const u8, method_name: []const u8) ?MethodDef {
+    self.graph.addModulePublic(module_path);
     const mod = self.graph.getModule(module_path) orelse return null;
     const tree = &mod.tree;
 
@@ -381,6 +473,7 @@ fn findMethodInModule(self: *TypeResolver, module_path: []const u8, type_name: [
 
 /// For file-as-struct modules (like fs/File.zig), look for methods in root declarations.
 fn findMethodInFileAsStruct(self: *TypeResolver, module_path: []const u8, method_name: []const u8) ?MethodDef {
+    self.graph.addModulePublic(module_path);
     const mod = self.graph.getModule(module_path) orelse return null;
     const tree = &mod.tree;
 
