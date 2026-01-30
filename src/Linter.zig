@@ -1151,8 +1151,20 @@ fn visitNode(self: *Linter, node: Ast.Node.Index) void {
         .@"return" => self.checkReturn(node),
         .call_one, .call_one_comma, .call, .call_comma => {
             self.checkCallArgs(node);
+            self.checkRedundantAsInCallArgs(node);
             self.checkDeprecatedCall(node);
             self.checkCompoundAssert(node);
+        },
+        .array_init_one,
+        .array_init_one_comma,
+        .array_init_dot_two,
+        .array_init_dot_two_comma,
+        .array_init_dot,
+        .array_init_dot_comma,
+        .array_init,
+        .array_init_comma,
+        => {
+            self.checkRedundantAsInArrayInit(node);
         },
         else => {},
     }
@@ -1512,6 +1524,115 @@ fn getTypeNodeName(self: *Linter, type_node: Ast.Node.Index) ?[]const u8 {
     const tag = self.tree.nodeTag(type_node);
     return switch (tag) {
         .identifier => self.tree.tokenSlice(self.tree.nodeMainToken(type_node)),
+        else => null,
+    };
+}
+
+fn checkRedundantAsInCallArgs(self: *Linter, node: Ast.Node.Index) void {
+    var call_buf: [1]Ast.Node.Index = undefined;
+    const call = self.tree.fullCall(&call_buf, node) orelse return;
+    const params = call.ast.params;
+    if (params.len == 0) return;
+
+    // Resolve the called function's prototype and determine param offset
+    const resolved = self.resolveCalledFnProto(call.ast.fn_expr) orelse return;
+    const fn_tree = resolved.tree;
+    var fn_buf: [1]Ast.Node.Index = undefined;
+    const fn_proto = fn_tree.fullFnProto(&fn_buf, resolved.fn_node) orelse return;
+
+    // For method calls (field_access), skip the receiver param
+    const skip_receiver = self.tree.nodeTag(call.ast.fn_expr) == .field_access;
+
+    var it = fn_proto.iterate(fn_tree);
+    var param_idx: usize = 0;
+
+    if (skip_receiver) {
+        _ = it.next();
+    }
+
+    while (it.next()) |param| : (param_idx += 1) {
+        if (param_idx >= params.len) break;
+        const arg = params[param_idx];
+
+        const as_type_name = self.getAsTypeName(arg) orelse continue;
+        const type_node = param.type_expr orelse continue;
+        const param_type_name = self.getTypeNodeNameFromTree(fn_tree, type_node) orelse continue;
+
+        if (std.mem.eql(u8, as_type_name, param_type_name)) {
+            const loc = self.tree.tokenLocation(0, self.tree.nodeMainToken(arg));
+            self.report(loc, .Z029, as_type_name);
+        }
+    }
+}
+
+const ResolvedFnProto = struct {
+    tree: *const Ast,
+    fn_node: Ast.Node.Index,
+};
+
+fn resolveCalledFnProto(self: *Linter, callee_expr: Ast.Node.Index) ?ResolvedFnProto {
+    const tag = self.tree.nodeTag(callee_expr);
+    switch (tag) {
+        .identifier => {
+            const fn_name = self.tree.tokenSlice(self.tree.nodeMainToken(callee_expr));
+            for (self.tree.rootDecls()) |decl_node| {
+                if (self.tree.nodeTag(decl_node) != .fn_decl) continue;
+                var buf: [1]Ast.Node.Index = undefined;
+                const fn_proto = self.tree.fullFnProto(&buf, decl_node) orelse continue;
+                const name_token = fn_proto.name_token orelse continue;
+                if (std.mem.eql(u8, self.tree.tokenSlice(name_token), fn_name)) {
+                    return .{ .tree = &self.tree, .fn_node = decl_node };
+                }
+            }
+        },
+        .field_access => {
+            const resolver = self.type_resolver orelse return null;
+            const mod_path = self.module_path orelse return null;
+            const data = self.tree.nodeData(callee_expr).node_and_token;
+            const receiver_node = data[0];
+            const method_name = self.tree.tokenSlice(data[1]);
+            const receiver_type = resolver.typeOf(mod_path, receiver_node);
+            const method_def = resolver.findMethodDef(receiver_type, method_name) orelse return null;
+            const mod = resolver.graph.getModule(method_def.module_path) orelse return null;
+            return .{ .tree = &mod.tree, .fn_node = method_def.node };
+        },
+        else => {},
+    }
+    return null;
+}
+
+fn checkRedundantAsInArrayInit(self: *Linter, node: Ast.Node.Index) void {
+    var buf: [2]Ast.Node.Index = undefined;
+    const array_init = self.tree.fullArrayInit(&buf, node) orelse return;
+    const type_expr = array_init.ast.type_expr.unwrap() orelse return;
+
+    // Get the element type from the array type expression
+    const elem_type_name = self.getArrayElemTypeName(type_expr) orelse return;
+
+    for (array_init.ast.elements) |elem| {
+        const as_type_name = self.getAsTypeName(elem) orelse continue;
+        if (std.mem.eql(u8, as_type_name, elem_type_name)) {
+            const loc = self.tree.tokenLocation(0, self.tree.nodeMainToken(elem));
+            self.report(loc, .Z029, as_type_name);
+        }
+    }
+}
+
+fn getArrayElemTypeName(self: *Linter, type_expr: Ast.Node.Index) ?[]const u8 {
+    const type_tag = self.tree.nodeTag(type_expr);
+    return switch (type_tag) {
+        .array_type, .array_type_sentinel => {
+            const array_type = self.tree.fullArrayType(type_expr) orelse return null;
+            return self.getTypeNodeName(array_type.ast.elem_type);
+        },
+        else => null,
+    };
+}
+
+fn getTypeNodeNameFromTree(_: *Linter, tree: *const Ast, type_node: Ast.Node.Index) ?[]const u8 {
+    const tag = tree.nodeTag(type_node);
+    return switch (tag) {
+        .identifier => tree.tokenSlice(tree.nodeMainToken(type_node)),
         else => null,
     };
 }
@@ -3922,4 +4043,107 @@ test "Z028: skip discard name" {
             try std.testing.expect(false);
         }
     }
+}
+
+test "Z029: detect redundant @as in call arg" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo(x: u32) void {
+        \\    _ = x;
+        \\}
+        \\pub fn main() void {
+        \\    foo(@as(u32, 1));
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: allow @as with different type in call arg" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo(x: u32) void {
+        \\    _ = x;
+        \\}
+        \\pub fn main() void {
+        \\    foo(@as(u16, 1));
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: detect redundant @as in array init" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\pub fn main() void {
+        \\    const xs = [_]u32{@as(u32, 1)};
+        \\    _ = xs;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: allow @as with different type in array init" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\pub fn main() void {
+        \\    const xs = [_]u32{@as(u16, 1)};
+        \\    _ = xs;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: detect redundant @as in method call arg" {
+    const ModuleGraph = @import("ModuleGraph.zig");
+    const source =
+        \\const MyType = struct {
+        \\    value: u32,
+        \\    pub fn setValue(self: *@This(), v: u32) void {
+        \\        self.value = v;
+        \\    }
+        \\};
+        \\const instance: MyType = .{ .value = 0 };
+        \\pub fn main() void {
+        \\    instance.setValue(@as(u32, 42));
+        \\}
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    var linter: Linter = .initWithSemantics(std.testing.allocator, source, path, &resolver, path, null);
+    defer linter.deinit();
+
+    linter.lint();
+
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z029));
+}
+
+test "Z029: multiple args with redundant @as" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn bar(a: u32, b: u32) void {
+        \\    _ = a;
+        \\    _ = b;
+        \\}
+        \\pub fn main() void {
+        \\    bar(@as(u32, 1), @as(u32, 2));
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(2, linter.diagnosticCount(.Z029));
 }
