@@ -98,16 +98,72 @@ test "ZXXX: allow valid case" {
 }
 ```
 
-## 5. Update Documentation (`README.md`)
+## 5. Update Documentation
 
-**IMPORTANT: Do not skip this step!**
+**IMPORTANT: Do not skip these steps!**
+
+### Add to README.md
 
 Add the rule to the rules table in README.md, maintaining numerical order:
 ```markdown
 | ZXXX | Brief description of what the rule checks |
 ```
 
-The description should be concise (one line) and explain what the rule enforces or detects.
+### Create Rule Documentation (`docs/rules/ZXXX.md`)
+
+Create a detailed documentation file with executable examples:
+
+```markdown
+---
+rule: ZXXX
+title: Brief description of the rule
+enabled: true
+---
+
+# ZXXX: Brief description
+
+Explanation of what this rule checks and why it matters.
+
+## Examples
+
+### Bad
+
+\`\`\`zig
+// expect: ZXXX
+code_that_triggers_the_rule();
+\`\`\`
+
+### Good
+
+\`\`\`zig
+code_that_passes();
+\`\`\`
+
+## Configuration
+
+(Include this section if the rule has configurable parameters)
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `max_length` | `u32` | `120` | Maximum allowed line length |
+
+Example `.ziglint.zon`:
+\`\`\`zig
+.rules = .{
+    .ZXXX = .{ .max_length = 80 },
+},
+\`\`\`
+
+## Rationale
+
+Why this rule exists and what problems it prevents.
+```
+
+**Key points:**
+- Code blocks with `// expect: ZXXX` comments are tested to trigger the rule
+- Code blocks without expect comments are tested to produce no warnings
+- These examples are validated by `zig build test` - if the rule changes and examples become inaccurate, the build fails
+- Include both bad (triggering) and good (passing) examples
 
 ## 6. Run Tests
 
