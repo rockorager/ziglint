@@ -2096,7 +2096,7 @@ fn reportLineLength(self: *Linter, line: usize, context: []const u8, max_len: u3
     }) catch {};
 }
 
-fn diagnosticCount(self: *const Linter, rule: rules.Rule) usize {
+pub fn diagnosticCount(self: *const Linter, rule: rules.Rule) usize {
     var count: usize = 0;
     for (self.diagnostics.items) |d| {
         if (d.rule == rule) count += 1;

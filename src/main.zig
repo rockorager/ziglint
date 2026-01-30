@@ -414,6 +414,7 @@ test {
     _ = @import("rules.zig");
     _ = @import("doc_comments.zig");
     _ = @import("TypeResolver.zig");
+    _ = @import("doc_tests.zig");
 }
 
 test "parseLibDirFromZigEnv" {
