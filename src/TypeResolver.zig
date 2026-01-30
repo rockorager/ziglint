@@ -189,6 +189,12 @@ pub fn findMethodDef(self: *TypeResolver, receiver_type: TypeInfo, method_name: 
     }
 }
 
+/// Finds a function definition by name in the given module.
+/// Handles both direct function declarations and const aliases to functions.
+pub fn findFnInCurrentModule(self: *TypeResolver, module_path: []const u8, fn_name: []const u8) ?MethodDef {
+    return self.findMethodInFileAsStruct(module_path, fn_name);
+}
+
 /// Returns true if the given node evaluates to a type rather than an instance.
 /// Distinguishes `const Foo = struct{...}` (type) from `const obj: Foo = .{}` (instance).
 pub fn isTypeRef(self: *TypeResolver, module_path: []const u8, node: Ast.Node.Index) bool {
@@ -390,6 +396,37 @@ fn findMethodInFileAsStruct(self: *TypeResolver, module_path: []const u8, method
                 return .{
                     .module_path = mod.path,
                     .node = decl,
+                    .name_token = fn_name_token,
+                    .line = @intCast(loc.line),
+                    .column = @intCast(loc.column),
+                };
+            }
+        } else if (tag == .simple_var_decl or tag == .aligned_var_decl or
+            tag == .local_var_decl or tag == .global_var_decl)
+        {
+            // Handle const declarations (may be aliases to functions)
+            const var_decl = tree.fullVarDecl(decl) orelse continue;
+            const name_token = var_decl.ast.mut_token + 1;
+            const decl_name = tree.tokenSlice(name_token);
+            if (!std.mem.eql(u8, decl_name, method_name)) continue;
+
+            const init_node = var_decl.ast.init_node.unwrap() orelse continue;
+            const init_tag = tree.nodeTag(init_node);
+
+            if (init_tag == .identifier) {
+                // It's an alias like `const ArrayListUnmanaged = ArrayList;`
+                // Follow the alias to find the actual function
+                const alias_target = tree.tokenSlice(tree.nodeMainToken(init_node));
+                return self.findMethodInFileAsStruct(module_path, alias_target);
+            } else if (init_tag == .fn_decl) {
+                // Inline function definition
+                var buf: [1]Ast.Node.Index = undefined;
+                const fn_proto = tree.fullFnProto(&buf, init_node) orelse continue;
+                const fn_name_token = fn_proto.name_token orelse name_token;
+                const loc = tree.tokenLocation(0, fn_name_token);
+                return .{
+                    .module_path = mod.path,
+                    .node = init_node,
                     .name_token = fn_name_token,
                     .line = @intCast(loc.line),
                     .column = @intCast(loc.column),
@@ -1783,4 +1820,83 @@ test "isTypeRef: identifier resolving to instance" {
     const var_decl = mod.tree.fullVarDecl(root_decls[1]).?;
     const init_node = var_decl.ast.init_node.unwrap().?;
     try std.testing.expect(!resolver.isTypeRef(path, init_node));
+}
+
+test "findFnInCurrentModule: type function" {
+    const source =
+        \\/// Deprecated: use NewList
+        \\pub fn OldList(comptime T: type) type {
+        \\    return struct { items: []T };
+        \\}
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    const method_def = resolver.findFnInCurrentModule(path, "OldList");
+    try std.testing.expect(method_def != null);
+}
+
+test "findFnInCurrentModule: direct function" {
+    const source =
+        \\/// Deprecated: use newFunc
+        \\pub fn oldFunc() void {}
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    const method_def = resolver.findFnInCurrentModule(path, "oldFunc");
+    try std.testing.expect(method_def != null);
+}
+
+test "findFnInCurrentModule: const alias to function" {
+    const source =
+        \\/// Deprecated: use newFunc
+        \\pub fn oldFunc() void {}
+        \\pub const aliasFunc = oldFunc;
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    const method_def = resolver.findFnInCurrentModule(path, "aliasFunc");
+    try std.testing.expect(method_def != null);
+    // Should resolve to oldFunc's node, not the alias
+    const mod = graph.getModule(path).?;
+    const doc_comments = @import("doc_comments.zig");
+    const doc = doc_comments.getDocComment(std.testing.allocator, &mod.tree, method_def.?.node);
+    defer if (doc) |d| std.testing.allocator.free(d);
+    try std.testing.expect(doc != null);
+    try std.testing.expect(std.mem.indexOf(u8, doc.?, "Deprecated") != null);
 }
