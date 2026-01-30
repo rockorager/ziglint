@@ -189,6 +189,13 @@ pub fn findMethodDef(self: *TypeResolver, receiver_type: TypeInfo, method_name: 
     }
 }
 
+/// Returns true if the given node evaluates to a type rather than an instance.
+/// Distinguishes `const Foo = struct{...}` (type) from `const obj: Foo = .{}` (instance).
+pub fn isTypeRef(self: *TypeResolver, module_path: []const u8, node: Ast.Node.Index) bool {
+    const mod = self.graph.getModule(module_path) orelse return false;
+    return self.nodeIsTypeRef(&mod.tree, node, module_path);
+}
+
 /// Resolves a stdlib path like "fs.File" to find the method.
 /// Follows the import chain: std.zig -> fs.zig -> File type -> method
 fn findMethodInStdlib(self: *TypeResolver, path: []const u8, method_name: []const u8) ?MethodDef {
@@ -905,6 +912,83 @@ fn resolveNumberLiteral(_: *TypeResolver, tree: *const Ast, node: Ast.Node.Index
     return .{ .primitive = .comptime_int };
 }
 
+fn nodeIsTypeRef(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Index, module_path: []const u8) bool {
+    return switch (tree.nodeTag(node)) {
+        .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => self.varDeclIsTypeRef(tree, node, module_path),
+        .identifier => self.identifierIsTypeRef(tree, node, module_path),
+        .field_access => self.fieldAccessIsTypeRef(tree, node, module_path),
+        .builtin_call_two, .builtin_call_two_comma => self.builtinCallIsTypeRef(tree, node),
+        .container_decl,
+        .container_decl_trailing,
+        .container_decl_two,
+        .container_decl_two_trailing,
+        .container_decl_arg,
+        .container_decl_arg_trailing,
+        .tagged_union,
+        .tagged_union_trailing,
+        .tagged_union_two,
+        .tagged_union_two_trailing,
+        .tagged_union_enum_tag,
+        .tagged_union_enum_tag_trailing,
+        => true,
+        .error_set_decl => true,
+        .fn_proto, .fn_proto_multi, .fn_proto_one, .fn_proto_simple => true,
+        .call_one, .call_one_comma, .call, .call_comma => blk: {
+            const type_info = self.resolveFunctionCall(tree, node, module_path);
+            break :blk type_info == .type_type;
+        },
+        else => false,
+    };
+}
+
+fn varDeclIsTypeRef(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Index, module_path: []const u8) bool {
+    const var_decl = tree.fullVarDecl(node) orelse return false;
+    if (var_decl.ast.type_node.unwrap()) |type_node| {
+        if (tree.nodeTag(type_node) == .identifier) {
+            return std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(type_node)), "type");
+        }
+        return false;
+    }
+    const init_node = var_decl.ast.init_node.unwrap() orelse return false;
+    return self.nodeIsTypeRef(tree, init_node, module_path);
+}
+
+fn identifierIsTypeRef(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Index, module_path: []const u8) bool {
+    const name = tree.tokenSlice(tree.nodeMainToken(node));
+    if (resolvePrimitiveType(name) != null) return true;
+    if (std.mem.eql(u8, name, "type")) return true;
+    for (tree.rootDecls()) |decl_node| {
+        switch (tree.nodeTag(decl_node)) {
+            .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => {
+                const var_decl = tree.fullVarDecl(decl_node) orelse continue;
+                const name_token = var_decl.ast.mut_token + 1;
+                if (!std.mem.eql(u8, tree.tokenSlice(name_token), name)) continue;
+                return self.varDeclIsTypeRef(tree, decl_node, module_path);
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn fieldAccessIsTypeRef(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Index, module_path: []const u8) bool {
+    const data = tree.nodeData(node).node_and_token;
+    if (!self.nodeIsTypeRef(tree, data[0], module_path)) return false;
+    const type_info = self.resolveFieldAccess(tree, node, module_path);
+    return switch (type_info) {
+        .std_type, .user_type, .type_type => true,
+        else => false,
+    };
+}
+
+fn builtinCallIsTypeRef(_: *TypeResolver, tree: *const Ast, node: Ast.Node.Index) bool {
+    const builtin_name = tree.tokenSlice(tree.nodeMainToken(node));
+    return std.mem.eql(u8, builtin_name, "@import") or
+        std.mem.eql(u8, builtin_name, "@This") or
+        std.mem.eql(u8, builtin_name, "@TypeOf") or
+        std.mem.eql(u8, builtin_name, "@Type");
+}
+
 test "resolve primitive types" {
     const source = "const x: u32 = 0;";
 
@@ -1432,4 +1516,210 @@ test "resolve unknown function call" {
     const root_decls = graph.getModule(path).?.tree.rootDecls();
     const type_info = resolver.typeOf(path, root_decls[0]);
     try std.testing.expect(type_info == .unknown);
+}
+
+test "isTypeRef: struct declaration" {
+    const source = "const Foo = struct { value: u32 };";
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    const root_decls = graph.getModule(path).?.tree.rootDecls();
+    try std.testing.expect(resolver.isTypeRef(path, root_decls[0]));
+}
+
+test "isTypeRef: instance with type annotation" {
+    const source =
+        \\const Foo = struct {};
+        \\const obj: Foo = .{};
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    const root_decls = graph.getModule(path).?.tree.rootDecls();
+    try std.testing.expect(resolver.isTypeRef(path, root_decls[0]));
+    try std.testing.expect(!resolver.isTypeRef(path, root_decls[1]));
+}
+
+test "isTypeRef: primitive typed variable" {
+    const source = "const x: u32 = 5;";
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    const root_decls = graph.getModule(path).?.tree.rootDecls();
+    try std.testing.expect(!resolver.isTypeRef(path, root_decls[0]));
+}
+
+test "isTypeRef: explicit type annotation" {
+    const source = "const T: type = u32;";
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    const root_decls = graph.getModule(path).?.tree.rootDecls();
+    try std.testing.expect(resolver.isTypeRef(path, root_decls[0]));
+}
+
+test "isTypeRef: enum declaration" {
+    const source = "const E = enum { a, b, c };";
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    const root_decls = graph.getModule(path).?.tree.rootDecls();
+    try std.testing.expect(resolver.isTypeRef(path, root_decls[0]));
+}
+
+test "isTypeRef: function call returning type" {
+    const source =
+        \\fn MyType() type {
+        \\    return struct {};
+        \\}
+        \\const T = MyType();
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    const root_decls = graph.getModule(path).?.tree.rootDecls();
+    try std.testing.expect(resolver.isTypeRef(path, root_decls[1]));
+}
+
+test "isTypeRef: function call returning value" {
+    const source =
+        \\fn getValue() u32 {
+        \\    return 5;
+        \\}
+        \\const x = getValue();
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    const root_decls = graph.getModule(path).?.tree.rootDecls();
+    try std.testing.expect(!resolver.isTypeRef(path, root_decls[1]));
+}
+
+test "isTypeRef: identifier resolving to struct" {
+    const source =
+        \\const Foo = struct {};
+        \\const Bar = Foo;
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    const mod = graph.getModule(path).?;
+    const root_decls = mod.tree.rootDecls();
+    const var_decl = mod.tree.fullVarDecl(root_decls[1]).?;
+    const init_node = var_decl.ast.init_node.unwrap().?;
+    try std.testing.expect(resolver.isTypeRef(path, init_node));
+}
+
+test "isTypeRef: identifier resolving to instance" {
+    const source =
+        \\const x: u32 = 5;
+        \\const y = x;
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    const mod = graph.getModule(path).?;
+    const root_decls = mod.tree.rootDecls();
+    const var_decl = mod.tree.fullVarDecl(root_decls[1]).?;
+    const init_node = var_decl.ast.init_node.unwrap().?;
+    try std.testing.expect(!resolver.isTypeRef(path, init_node));
 }
