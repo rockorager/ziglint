@@ -45,6 +45,10 @@ Directories are scanned recursively for `.zig` files.
 | Z022 | `@This()` alias in anonymous/local struct should be `Self` |
 | Z023 | Parameter order: comptime before runtime, pointers before values |
 | Z024 | Line exceeds maximum length (default: 120) |
+| Z025 | Redundant `catch |err| return err`; use `try` instead |
+| Z026 | Empty `catch` block suppresses errors |
+| Z027 | Access declaration through type instead of instance |
+| Z029 | Redundant `@as` cast; type already known from context |
 
 ## Configuration
 
