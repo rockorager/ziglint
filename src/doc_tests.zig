@@ -8,6 +8,8 @@
 
 const std = @import("std");
 const Linter = @import("Linter.zig");
+const ModuleGraph = @import("ModuleGraph.zig");
+const TypeResolver = @import("TypeResolver.zig");
 const rules = @import("rules.zig");
 
 const DocTest = struct {
@@ -90,13 +92,28 @@ fn parseMarkdown(allocator: std.mem.Allocator, content: []const u8) !ParsedDoc {
     };
 }
 
-fn runDocTest(allocator: std.mem.Allocator, doc_path: []const u8, doc_test: DocTest) !void {
+fn runDocTest(allocator: std.mem.Allocator, doc_path: []const u8, doc_test: DocTest, tmp_dir: *std.testing.TmpDir) !void {
     // Linter expects sentinel-terminated source
     const source = try allocator.allocSentinel(u8, doc_test.code.len, 0);
     defer allocator.free(source);
     @memcpy(source, doc_test.code);
 
-    var linter: Linter = .init(allocator, source, "doc_test.zig", null);
+    // Write to temp file for semantic analysis
+    try tmp_dir.dir.writeFile(.{ .sub_path = "doc_test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(allocator, "doc_test.zig");
+    defer allocator.free(path);
+
+    // Try to create ModuleGraph for semantic analysis (may fail for invalid code)
+    var graph: ?ModuleGraph = ModuleGraph.init(allocator, path, null) catch null;
+    defer if (graph) |*g| g.deinit();
+
+    var resolver: ?TypeResolver = if (graph) |*g| TypeResolver.init(allocator, g) else null;
+    defer if (resolver) |*r| r.deinit();
+
+    var linter: Linter = if (resolver) |*r|
+        .initWithSemantics(allocator, source, path, r, path, null)
+    else
+        .init(allocator, source, path, null);
     defer linter.deinit();
     linter.lint();
 
@@ -144,6 +161,10 @@ pub fn runAllDocTests(allocator: std.mem.Allocator) !void {
     };
     defer dir.close();
 
+    // Create temp directory for semantic analysis
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
     var file_count: usize = 0;
     var test_count: usize = 0;
     var iter = dir.iterate();
@@ -167,7 +188,7 @@ pub fn runAllDocTests(allocator: std.mem.Allocator) !void {
         defer allocator.free(full_path);
 
         for (doc.tests) |doc_test| {
-            try runDocTest(allocator, full_path, doc_test);
+            try runDocTest(allocator, full_path, doc_test, &tmp_dir);
             test_count += 1;
         }
         file_count += 1;
