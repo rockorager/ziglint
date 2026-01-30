@@ -1725,11 +1725,12 @@ test "Z001: allow camelCase function" {
     try std.testing.expectEqual(0, linter.diagnostics.items.len);
 }
 
-test "Z001: allow snake_case function" {
+test "Z001: detect snake_case function" {
     var linter: Linter = .init(std.testing.allocator, "fn my_func() void {}", "test.zig", null);
     defer linter.deinit();
     linter.lint();
-    try std.testing.expectEqual(0, linter.diagnostics.items.len);
+    try std.testing.expectEqual(1, linter.diagnostics.items.len);
+    try std.testing.expectEqual(rules.Rule.Z001, linter.diagnostics.items[0].rule);
 }
 
 test "Z001: allow underscore prefix (private)" {
