@@ -1147,6 +1147,12 @@ fn visitChildren(self: *Linter, node: Ast.Node.Index) void {
             if (data[0].unwrap()) |n| self.visitNode(n);
             if (data[1].unwrap()) |n| self.visitNode(n);
         },
+        // Assignments - visit both sides to catch calls in RHS like `_ = deprecatedFunc()`
+        .assign => {
+            const data = self.tree.nodeData(node).node_and_node;
+            self.visitNode(data[0]);
+            self.visitNode(data[1]);
+        },
         // Variable declarations - visit the init node (RHS) to recurse into struct/enum definitions
         .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => {
             const var_decl = self.tree.fullVarDecl(node) orelse return;
@@ -1683,25 +1689,41 @@ fn checkDeprecatedCall(self: *Linter, node: Ast.Node.Index) void {
     const call = self.tree.fullCall(&buf, node) orelse return;
 
     const fn_expr = call.ast.fn_expr;
-    if (self.tree.nodeTag(fn_expr) != .field_access) return;
+    const fn_expr_tag = self.tree.nodeTag(fn_expr);
 
-    const data = self.tree.nodeData(fn_expr).node_and_token;
-    const receiver_node = data[0];
-    const method_token = data[1];
-    const method_name = self.tree.tokenSlice(method_token);
+    var method_def: ?TypeResolver.MethodDef = null;
+    var name_token: Ast.TokenIndex = undefined;
+    var fn_name: []const u8 = undefined;
 
-    const receiver_type = resolver.typeOf(mod_path, receiver_node);
+    if (fn_expr_tag == .field_access) {
+        const data = self.tree.nodeData(fn_expr).node_and_token;
+        const receiver_node = data[0];
+        name_token = data[1];
+        fn_name = self.tree.tokenSlice(name_token);
 
-    const method_def = resolver.findMethodDef(receiver_type, method_name) orelse return;
+        const receiver_type = resolver.typeOf(mod_path, receiver_node);
+        method_def = resolver.findMethodDef(receiver_type, fn_name);
+    } else if (fn_expr_tag == .identifier) {
+        // Direct function call in the same module (e.g., `DeprecatedFunc()`)
+        name_token = self.tree.nodeMainToken(fn_expr);
+        fn_name = self.tree.tokenSlice(name_token);
 
-    const mod = resolver.graph.getModule(method_def.module_path) orelse return;
-    const doc = doc_comments.getDocComment(self.allocator, &mod.tree, method_def.node) orelse return;
+        // Look up the function in the current module
+        method_def = resolver.findFnInCurrentModule(mod_path, fn_name);
+    } else {
+        return;
+    }
+
+    const def = method_def orelse return;
+
+    const mod = resolver.graph.getModule(def.module_path) orelse return;
+    const doc = doc_comments.getDocComment(self.allocator, &mod.tree, def.node) orelse return;
     defer self.allocator.free(doc);
 
     if (containsDeprecated(doc)) {
-        const loc = self.tree.tokenLocation(0, method_token);
+        const loc = self.tree.tokenLocation(0, name_token);
         // Build message with doc comment
-        const msg = std.fmt.allocPrint(self.allocator, "'{s}' is deprecated: {s}", .{ method_name, doc }) catch return;
+        const msg = std.fmt.allocPrint(self.allocator, "'{s}' is deprecated: {s}", .{ fn_name, doc }) catch return;
         self.allocated_contexts.append(self.allocator, msg) catch {
             self.allocator.free(msg);
             return;
@@ -2665,6 +2687,164 @@ test "Z011: without semantic context, no Z011 warnings" {
     for (linter.diagnostics.items) |d| {
         try std.testing.expect(d.rule != rules.Rule.Z011);
     }
+}
+
+test "Z011: detect deprecated direct function call" {
+    const ModuleGraph = @import("ModuleGraph.zig");
+    const source =
+        \\/// Deprecated: use newFunc instead
+        \\pub fn oldFunc() void {}
+        \\pub fn main() void {
+        \\    oldFunc();
+        \\}
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    var linter: Linter = .initWithSemantics(std.testing.allocator, source, path, &resolver, path, null);
+    defer linter.deinit();
+
+    linter.lint();
+
+    var found_z011 = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z011) {
+            found_z011 = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_z011);
+}
+
+test "Z011: detect deprecated function alias" {
+    const ModuleGraph = @import("ModuleGraph.zig");
+    const source =
+        \\/// Deprecated: use newFunc instead
+        \\pub fn oldFunc() void {}
+        \\pub const aliasFunc = oldFunc;
+        \\pub fn main() void {
+        \\    aliasFunc();
+        \\}
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    var linter: Linter = .initWithSemantics(std.testing.allocator, source, path, &resolver, path, null);
+    defer linter.deinit();
+
+    linter.lint();
+
+    var found_z011 = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z011) {
+            found_z011 = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_z011);
+}
+
+test "Z011: detect deprecated type function" {
+    const ModuleGraph = @import("ModuleGraph.zig");
+    const source =
+        \\/// Deprecated: use NewList instead
+        \\pub fn OldList(comptime T: type) type {
+        \\    return struct { items: []T };
+        \\}
+        \\pub fn main() void {
+        \\    _ = OldList(u8);
+        \\}
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    var linter: Linter = .initWithSemantics(std.testing.allocator, source, path, &resolver, path, null);
+    defer linter.deinit();
+
+    linter.lint();
+
+    var found_z011 = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z011) {
+            found_z011 = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_z011);
+}
+
+test "Z011: detect deprecated type function alias" {
+    const ModuleGraph = @import("ModuleGraph.zig");
+    const source =
+        \\/// Deprecated: use NewList instead
+        \\pub fn OldList(comptime T: type) type {
+        \\    return struct { items: []T };
+        \\}
+        \\pub const DeprecatedAlias = OldList;
+        \\pub fn main() void {
+        \\    _ = DeprecatedAlias(u8);
+        \\}
+    ;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    var linter: Linter = .initWithSemantics(std.testing.allocator, source, path, &resolver, path, null);
+    defer linter.deinit();
+
+    linter.lint();
+
+    var found_z011 = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z011) {
+            found_z011 = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_z011);
 }
 
 test "containsDeprecated" {
