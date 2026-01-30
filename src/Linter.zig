@@ -2010,6 +2010,13 @@ fn isTypeAlias(self: *Linter, var_decl: Ast.full.VarDecl) bool {
         .error_set_decl,
         .merge_error_sets,
         => true,
+        .block_two, .block_two_semicolon, .block, .block_semicolon => blk: {
+            // Labeled blocks that break with a type (e.g., `blk: { break :blk @Type(...); }`)
+            // Check the name — if it's PascalCase, treat as type alias
+            const name_token = var_decl.ast.mut_token + 1;
+            const name = self.tree.tokenSlice(name_token);
+            break :blk isPascalCase(name);
+        },
         else => false,
     };
 }
@@ -2382,6 +2389,33 @@ test "Z006: allow type alias with primitive type" {
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow PascalCase labeled block type alias" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Config = blk: {
+        \\    break :blk @Type(.{ .@"struct" = .{
+        \\        .layout = .auto,
+        \\        .fields = &.{},
+        \\        .decls = &.{},
+        \\        .is_tuple = false,
+        \\    } });
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: detect camelCase labeled block (not type)" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const myValue = blk: {
+        \\    break :blk 42;
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z006));
 }
 
 test "Z006: detect snake_case identifier assignment" {
