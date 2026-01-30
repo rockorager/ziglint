@@ -1903,7 +1903,8 @@ fn isTypeAlias(self: *Linter, var_decl: Ast.full.VarDecl) bool {
             const token = self.tree.tokenSlice(self.tree.nodeMainToken(init_node));
             break :blk std.mem.eql(u8, token, "@This") or
                 std.mem.eql(u8, token, "@import") or
-                std.mem.eql(u8, token, "@Type");
+                std.mem.eql(u8, token, "@Type") or
+                std.mem.eql(u8, token, "@TypeOf");
         },
         .call_one, .call_one_comma => blk: {
             // Check if calling a PascalCase function (type constructor)
@@ -1947,10 +1948,31 @@ fn isTypeAlias(self: *Linter, var_decl: Ast.full.VarDecl) bool {
         .tagged_union_enum_tag_trailing,
         .error_set_decl,
         .merge_error_sets,
+        // Type expressions
+        .array_type,
+        .array_type_sentinel,
+        .ptr_type_aligned,
+        .ptr_type_sentinel,
+        .ptr_type,
+        .ptr_type_bit_range,
+        .optional_type,
+        .error_union,
+        .fn_proto,
+        .fn_proto_multi,
+        .fn_proto_one,
+        .fn_proto_simple,
         => true,
-        .block_two, .block_two_semicolon, .block, .block_semicolon => blk: {
-            // Labeled blocks that break with a type (e.g., `blk: { break :blk @Type(...); }`)
-            // Check the name — if it's PascalCase, treat as type alias
+        .block_two,
+        .block_two_semicolon,
+        .block,
+        .block_semicolon,
+        .@"if",
+        .if_simple,
+        .@"switch",
+        .switch_comma,
+        => blk: {
+            // These expressions can return either types or values.
+            // Use PascalCase name as heuristic for type alias.
             const name_token = var_decl.ast.mut_token + 1;
             const name = self.tree.tokenSlice(name_token);
             break :blk isPascalCase(name);
@@ -2264,6 +2286,13 @@ test "Z006: allow type alias with @Type()" {
     try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
 }
 
+test "Z006: allow type alias with @TypeOf()" {
+    var linter: Linter = .init(std.testing.allocator, "fn foo(value: anytype) void { const T = @TypeOf(value); _ = T; }", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
 test "Z006: allow type alias with struct" {
     var linter: Linter = .init(std.testing.allocator, "const MyStruct = struct { x: u32 };", "test.zig", null);
     defer linter.deinit();
@@ -2358,6 +2387,83 @@ test "Z006: detect camelCase labeled block (not type)" {
 
 test "Z006: detect snake_case identifier assignment" {
     var linter: Linter = .init(std.testing.allocator, "const MyThing = some_value;", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow type alias with array type" {
+    var linter: Linter = .init(std.testing.allocator, "const Buffer = [8192]u8;", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow type alias with sentinel array type" {
+    var linter: Linter = .init(std.testing.allocator, "const CString = [*:0]const u8;", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow type alias with pointer type" {
+    var linter: Linter = .init(std.testing.allocator, "const BytePtr = *const u8;", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow type alias with optional type" {
+    var linter: Linter = .init(std.testing.allocator, "const MaybeInt = ?i32;", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow type alias with error union type" {
+    var linter: Linter = .init(std.testing.allocator, "const Result = anyerror!i32;", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow type alias with function pointer type" {
+    var linter: Linter = .init(std.testing.allocator, "const Handler = *const fn (*u8) anyerror!void;", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow type alias with bare function type" {
+    var linter: Linter = .init(std.testing.allocator, "const Callback = fn (i32) void;", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow PascalCase comptime if type alias" {
+    var linter: Linter = .init(std.testing.allocator, "const ThreadPool = if (true) u32 else void;", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: detect camelCase comptime if (not type)" {
+    var linter: Linter = .init(std.testing.allocator, "const threadPool = if (true) u32 else void;", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow PascalCase switch type alias" {
+    var linter: Linter = .init(std.testing.allocator, "const MyType = switch (x) { .a => u32, .b => i32 };", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: detect camelCase switch (not type)" {
+    var linter: Linter = .init(std.testing.allocator, "const myValue = switch (x) { .a => 1, .b => 2 };", "test.zig", null);
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(1, linter.diagnosticCount(.Z006));
