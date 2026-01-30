@@ -143,6 +143,7 @@ pub fn lint(self: *Linter) void {
 
     self.checkUnusedImports();
     self.checkThisBuiltin();
+    self.checkCatchReturnAll();
 }
 
 fn collectAllIdentifiers(self: *Linter) void {
@@ -1279,6 +1280,36 @@ fn checkReturnTry(self: *Linter, return_node: Ast.Node.Index, return_expr: Ast.N
 
     const loc = self.tree.tokenLocation(0, self.tree.nodeMainToken(return_node));
     self.report(loc, .Z017, truncated);
+}
+
+fn checkCatchReturnAll(self: *Linter) void {
+    for (0..self.tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @enumFromInt(i);
+        if (self.tree.nodeTag(node) != .@"catch") continue;
+
+        const data = self.tree.nodeData(node).node_and_node;
+        const rhs = data[1];
+
+        if (self.tree.nodeTag(rhs) != .@"return") continue;
+
+        // Must have a capture payload: `catch |err|`
+        const catch_token = self.tree.nodeMainToken(node);
+        const pipe_token = catch_token + 1;
+        if (self.tree.tokenTag(pipe_token) != .pipe) continue;
+
+        const payload_token = pipe_token + 1;
+        const payload_name = self.tree.tokenSlice(payload_token);
+
+        // The return expression must be an identifier matching the payload
+        const return_expr = self.tree.nodeData(rhs).opt_node.unwrap() orelse continue;
+        if (self.tree.nodeTag(return_expr) != .identifier) continue;
+        const return_name = self.tree.tokenSlice(self.tree.nodeMainToken(return_expr));
+
+        if (!std.mem.eql(u8, payload_name, return_name)) continue;
+
+        const loc = self.tree.tokenLocation(0, catch_token);
+        self.report(loc, .Z025, payload_name);
+    }
 }
 
 fn checkRedundantAsInReturn(self: *Linter, return_node: Ast.Node.Index, return_expr: Ast.Node.Index) void {
@@ -3154,6 +3185,69 @@ test "Z024: allow short line" {
     linter.lint();
     for (linter.diagnostics.items) |d| {
         if (d.rule == rules.Rule.Z024) {
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "Z025: detect catch return" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo() !u32 {
+        \\    return bar() catch |err| return err;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    var found = false;
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z025) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "Z025: allow catch with different body" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo() !u32 {
+        \\    return bar() catch |err| {
+        \\        log.err("{}", .{err});
+        \\        return err;
+        \\    };
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z025) {
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "Z025: allow catch without payload" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo() !u32 {
+        \\    return bar() catch return;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z025) {
+            try std.testing.expect(false);
+        }
+    }
+}
+
+test "Z025: allow catch returning different value" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn foo() !u32 {
+        \\    return bar() catch |err| return error.Other;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        if (d.rule == rules.Rule.Z025) {
             try std.testing.expect(false);
         }
     }

@@ -26,6 +26,7 @@ pub const Rule = enum(u16) {
     Z022 = 22,
     Z023 = 23,
     Z024 = 24,
+    Z025 = 25,
 
     /// Returns the config struct type for this rule.
     /// All config types have `enabled: bool` (default varies per rule).
@@ -171,6 +172,13 @@ pub const Rule = enum(u16) {
                 const actual = context[0..sep];
                 const max = if (sep < context.len) context[sep + 1 ..] else "120";
                 try writer.print("line exceeds {s}{s}{s} characters ({s}{s}{s} chars)", .{ y, max, r, y, actual, r });
+            },
+            // redundant catch: `catch |err| return err` -> use `try`
+            // catch=purple, try=purple, expr=yellow, punctuation=dim
+            .Z025 => {
+                try writer.print("redundant {s}catch{s}: {s}`{s}{s}catch{s} {s}|{s}{s}{s}{s}| {s}{s}return{s} {s}{s}{s}`{s} -> use {s}try{s}", .{
+                    p, r, d, r, p, r, d, r, y, context, d, r, p, r, y, context, d, r, p, r,
+                });
             },
         }
     }
