@@ -675,6 +675,34 @@ fn findEnclosingStructName(self: *Linter, start_node: Ast.Node.Index) ?[]const u
     };
 }
 
+/// Find the enclosing container (struct/union/enum) for a given node
+fn findEnclosingContainer(self: *Linter, start_node: Ast.Node.Index) Ast.Node.OptionalIndex {
+    var current = start_node;
+
+    while (true) {
+        const parent_opt = self.parent_map[@intFromEnum(current)];
+        const parent = parent_opt.unwrap() orelse return .none;
+        const parent_tag = self.tree.nodeTag(parent);
+
+        const is_container = switch (parent_tag) {
+            .container_decl,
+            .container_decl_trailing,
+            .container_decl_two,
+            .container_decl_two_trailing,
+            .container_decl_arg,
+            .container_decl_arg_trailing,
+            => true,
+            else => false,
+        };
+
+        if (is_container) {
+            return parent.toOptional();
+        }
+
+        current = parent;
+    }
+}
+
 fn checkFileAsStruct(self: *Linter) void {
     // Check if file has top-level fields (container fields at root level)
     var has_top_level_fields = false;
@@ -833,14 +861,54 @@ fn isTypeExpression(self: *Linter, node: Ast.Node.Index) bool {
     };
 }
 
-fn isPrivateTypeRef(self: *Linter, name: []const u8) bool {
+fn isPrivateTypeRef(self: *Linter, name: []const u8, enclosing_container: Ast.Node.OptionalIndex) bool {
     if (!isPascalCase(name)) return false;
     if (isBuiltinType(name)) return false;
     if (self.public_types.contains(name)) return false;
     if (self.imported_types.contains(name)) return false;
     // Don't flag Self type (type matching filename for file-as-struct pattern)
     if (self.isSelfType(name)) return false;
+    // Check if type is pub within the enclosing container
+    if (self.isPublicInContainer(name, enclosing_container)) return false;
     return true;
+}
+
+/// Check if a type name is declared as `pub const` within the given container
+fn isPublicInContainer(self: *Linter, name: []const u8, container_opt: Ast.Node.OptionalIndex) bool {
+    const container = container_opt.unwrap() orelse return false;
+    const members = self.getContainerMembers(container) orelse return false;
+
+    for (members) |member| {
+        const tag = self.tree.nodeTag(member);
+        switch (tag) {
+            .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => {
+                // Check if this is a pub declaration
+                if (!self.isPublicDecl(member)) continue;
+
+                // Check if the name matches
+                const var_decl = self.tree.fullVarDecl(member) orelse continue;
+                const name_token = var_decl.ast.mut_token + 1;
+                const decl_name = self.tree.tokenSlice(name_token);
+                if (std.mem.eql(u8, decl_name, name)) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+/// Get the member declarations of a container node
+fn getContainerMembers(self: *Linter, node: Ast.Node.Index) ?[]const Ast.Node.Index {
+    const tag = self.tree.nodeTag(node);
+    return switch (tag) {
+        .container_decl, .container_decl_trailing => self.tree.containerDecl(node).ast.members,
+        .container_decl_two, .container_decl_two_trailing => blk: {
+            var buf: [2]Ast.Node.Index = undefined;
+            break :blk self.tree.containerDeclTwo(&buf, node).ast.members;
+        },
+        .container_decl_arg, .container_decl_arg_trailing => self.tree.containerDeclArg(node).ast.members,
+        else => null,
+    };
 }
 
 fn isSelfType(self: *Linter, name: []const u8) bool {
@@ -1103,6 +1171,9 @@ fn checkExposedPrivateType(self: *Linter, node: Ast.Node.Index) void {
 
     if (!self.isPublicDecl(node)) return;
 
+    // Find enclosing container (struct/union/enum) if any
+    const enclosing_container = self.findEnclosingContainer(node);
+
     // Collect generic type parameter names
     var generic_params: [16][]const u8 = undefined;
     var generic_count: usize = 0;
@@ -1124,7 +1195,7 @@ fn checkExposedPrivateType(self: *Linter, node: Ast.Node.Index) void {
 
     // Check return type
     if (fn_proto.ast.return_type.unwrap()) |ret_node| {
-        self.checkTypeNodeForPrivateWithGenerics(ret_node, fn_proto, generic_params[0..generic_count]);
+        self.checkTypeNodeForPrivateWithGenerics(ret_node, fn_proto, generic_params[0..generic_count], enclosing_container);
     }
 
     // Check parameter types
@@ -1136,7 +1207,7 @@ fn checkExposedPrivateType(self: *Linter, node: Ast.Node.Index) void {
             const type_name = self.tree.tokenSlice(self.tree.nodeMainToken(type_node));
             if (std.mem.eql(u8, type_name, "type")) continue;
         }
-        self.checkTypeNodeForPrivateWithGenerics(type_node, fn_proto, generic_params[0..generic_count]);
+        self.checkTypeNodeForPrivateWithGenerics(type_node, fn_proto, generic_params[0..generic_count], enclosing_container);
     }
 }
 
@@ -1145,8 +1216,9 @@ fn checkTypeNodeForPrivateWithGenerics(
     type_node: Ast.Node.Index,
     fn_proto: Ast.full.FnProto,
     generic_params: []const []const u8,
+    enclosing_container: Ast.Node.OptionalIndex,
 ) void {
-    self.checkTypeNodeForPrivateImpl(type_node, fn_proto, generic_params, false);
+    self.checkTypeNodeForPrivateImpl(type_node, fn_proto, generic_params, false, enclosing_container);
 }
 
 fn checkTypeNodeForPrivateImpl(
@@ -1155,6 +1227,7 @@ fn checkTypeNodeForPrivateImpl(
     fn_proto: Ast.full.FnProto,
     generic_params: []const []const u8,
     is_error_position: bool,
+    enclosing_container: Ast.Node.OptionalIndex,
 ) void {
     const tag = self.tree.nodeTag(type_node);
 
@@ -1165,18 +1238,18 @@ fn checkTypeNodeForPrivateImpl(
             for (generic_params) |gp| {
                 if (std.mem.eql(u8, type_name, gp)) return;
             }
-            if (self.isPrivateTypeRef(type_name)) {
+            if (self.isPrivateTypeRef(type_name, enclosing_container)) {
                 self.reportPrivateType(fn_proto, type_name, is_error_position);
             }
         },
         .optional_type => {
             const child = self.tree.nodeData(type_node).node;
-            self.checkTypeNodeForPrivateImpl(child, fn_proto, generic_params, is_error_position);
+            self.checkTypeNodeForPrivateImpl(child, fn_proto, generic_params, is_error_position, enclosing_container);
         },
         .error_union => {
             const data = self.tree.nodeData(type_node).node_and_node;
-            self.checkTypeNodeForPrivateImpl(data[0], fn_proto, generic_params, true);
-            self.checkTypeNodeForPrivateImpl(data[1], fn_proto, generic_params, false);
+            self.checkTypeNodeForPrivateImpl(data[0], fn_proto, generic_params, true, enclosing_container);
+            self.checkTypeNodeForPrivateImpl(data[1], fn_proto, generic_params, false, enclosing_container);
         },
         else => {},
     }
@@ -3404,6 +3477,34 @@ test "Z012: pub fn returning public type is ok" {
     for (linter.diagnostics.items) |d| {
         try std.testing.expect(d.rule != rules.Rule.Z012);
     }
+}
+
+test "Z012: pub fn using pub type from enclosing struct is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    pub const Inner = struct {};
+        \\    pub fn a(i: Inner) void { _ = i; }
+        \\    pub fn getInner() Inner { return .{}; }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    for (linter.diagnostics.items) |d| {
+        try std.testing.expect(d.rule != rules.Rule.Z012);
+    }
+}
+
+test "Z012: pub fn using non-pub type from enclosing struct is error" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    const Inner = struct {};
+        \\    pub fn a(i: Inner) void { _ = i; }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnostics.items.len);
+    try std.testing.expectEqual(rules.Rule.Z012, linter.diagnostics.items[0].rule);
 }
 
 test "Z012: pub fn returning builtin type is ok" {
