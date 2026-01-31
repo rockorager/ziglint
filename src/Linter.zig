@@ -1335,7 +1335,7 @@ fn checkVarDecl(self: *Linter, node: Ast.Node.Index) void {
         }
     }
 
-    if (!isSnakeCase(name) and !isTypeAlias(self, var_decl)) {
+    if (!isSnakeCase(name) and !isTypeAlias(self, var_decl) and !isFunctionAlias(self, var_decl)) {
         const loc = self.tree.tokenLocation(0, name_token);
         self.report(loc, .Z006, name);
     }
@@ -2134,6 +2134,36 @@ fn isTypeAlias(self: *Linter, var_decl: Ast.full.VarDecl) bool {
     };
 }
 
+/// Checks if the variable declaration is a function alias (assigning a camelCase identifier).
+/// Function aliases are allowed to use camelCase names.
+fn isFunctionAlias(self: *Linter, var_decl: Ast.full.VarDecl) bool {
+    const init_node = var_decl.ast.init_node.unwrap() orelse return false;
+    const tag = self.tree.nodeTag(init_node);
+    return switch (tag) {
+        .identifier => blk: {
+            const token = self.tree.tokenSlice(self.tree.nodeMainToken(init_node));
+            break :blk isCamelCase(token);
+        },
+        .field_access => blk: {
+            const data = self.tree.nodeData(init_node).node_and_token;
+            const field_name = self.tree.tokenSlice(data[1]);
+            break :blk isCamelCase(field_name);
+        },
+        else => false,
+    };
+}
+
+fn isCamelCase(name: []const u8) bool {
+    if (name.len == 0) return false;
+    // Must start with lowercase letter
+    if (name[0] < 'a' or name[0] > 'z') return false;
+    // No underscores allowed
+    for (name) |c| {
+        if (c == '_') return false;
+    }
+    return true;
+}
+
 fn isIgnored(self: *Linter, line: usize, rule: rules.Rule) bool {
     // Check inline comment on current line
     if (self.lineHasIgnore(self.getLineText(line), rule)) return true;
@@ -2620,6 +2650,20 @@ test "Z006: detect camelCase switch (not type)" {
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(1, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow camelCase function alias" {
+    var linter: Linter = .init(std.testing.allocator, "fn fooBar() void {} const myAlias = fooBar;", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow camelCase function alias with field access" {
+    var linter: Linter = .init(std.testing.allocator, "const std = @import(\"std\"); const myAlias = std.someFunc;", "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
 }
 
 test "inline ignore: single rule" {
