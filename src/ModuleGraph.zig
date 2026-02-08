@@ -80,13 +80,22 @@ fn addModule(self: *ModuleGraph, path: []const u8) !void {
         return;
     };
 
-    const zir: ?Zir = if (tree.errors.len == 0)
-        AstGen.generate(self.allocator, tree) catch |err| blk: {
-            std.log.warn("ZIR generation failed for '{s}': {}", .{ canonical, err });
-            break :blk null;
-        }
-    else
-        null;
+    // ZIR generation is disabled for performance. It was added in commit 14bbe87 (Jan 2026)
+    // to support future control flow analysis (see issue #18), but no rules currently use it.
+    // Disabling it provides a ~5x speedup in module graph construction:
+    //   - With ZIR:    ~1945ms for build.zig (308 modules)
+    //   - Without ZIR: ~377ms for build.zig (308 modules)
+    // If control flow analysis is implemented, ZIR can be generated lazily on-demand or
+    // re-enabled here by uncommenting the code below:
+    //
+    // const zir: ?Zir = if (tree.errors.len == 0)
+    //     AstGen.generate(self.allocator, tree) catch |err| blk: {
+    //         std.log.warn("ZIR generation failed for '{s}': {}", .{ canonical, err });
+    //         break :blk null;
+    //     }
+    // else
+    //     null;
+    const zir: ?Zir = null;
 
     try self.modules.put(self.allocator, canonical, .{
         .path = canonical,
@@ -189,7 +198,7 @@ fn checkForImport(
 }
 
 fn resolveImportPath(self: *ModuleGraph, import_str: []const u8, module_path: []const u8) !?[]const u8 {
-    // Handle "std" import
+    // Handle "std" import - add it to the graph but don't recurse into its imports
     if (std.mem.eql(u8, import_str, "std")) {
         const lib_path = self.zig_lib_path orelse return null;
         // ziglint-ignore: Z017 (false positive: join returns ![]u8 but function returns !?[]const u8)
@@ -198,6 +207,15 @@ fn resolveImportPath(self: *ModuleGraph, import_str: []const u8, module_path: []
 
     // Handle builtin (skip it)
     if (std.mem.eql(u8, import_str, "builtin")) {
+        return null;
+    }
+
+    // Skip imports from within the Zig standard library to avoid recursively loading 300+ modules.
+    // When linting user code, we typically don't need to parse all of std (e.g., build.zig
+    // would trigger loading 308 modules, taking ~900ms for AST parsing alone).
+    // This optimization loads only the root std.zig (2 modules total instead of 308).
+    const lib_path = self.zig_lib_path orelse "";
+    if (lib_path.len > 0 and std.mem.startsWith(u8, module_path, lib_path)) {
         return null;
     }
 
@@ -303,38 +321,40 @@ test "no duplicate modules" {
     try std.testing.expectEqual(3, graph.moduleCount());
 }
 
-test "generate ZIR for valid modules" {
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
+// NOTE: These tests are disabled because ZIR generation is disabled for performance.
+// See issue #18 and commit 14bbe87. Re-enable these tests if ZIR is needed in the future.
+// test "generate ZIR for valid modules" {
+//     var tmp_dir = std.testing.tmpDir(.{});
+//     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "main.zig", .data = "pub fn main() void {}" });
+//     try tmp_dir.dir.writeFile(.{ .sub_path = "main.zig", .data = "pub fn main() void {}" });
 
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "main.zig");
-    defer std.testing.allocator.free(path);
+//     const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "main.zig");
+//     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
-    defer graph.deinit();
+//     var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+//     defer graph.deinit();
 
-    try std.testing.expectEqual(1, graph.moduleCount());
-    try std.testing.expectEqual(1, graph.zirCount());
+//     try std.testing.expectEqual(1, graph.moduleCount());
+//     try std.testing.expectEqual(1, graph.zirCount());
 
-    const mod = graph.getModule(path);
-    try std.testing.expect(mod != null);
-    try std.testing.expect(mod.?.zir != null);
-}
+//     const mod = graph.getModule(path);
+//     try std.testing.expect(mod != null);
+//     try std.testing.expect(mod.?.zir != null);
+// }
 
-test "skip ZIR for modules with parse errors" {
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
+// test "skip ZIR for modules with parse errors" {
+//     var tmp_dir = std.testing.tmpDir(.{});
+//     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "main.zig", .data = "fn broken( {}" });
+//     try tmp_dir.dir.writeFile(.{ .sub_path = "main.zig", .data = "fn broken( {}" });
 
-    const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "main.zig");
-    defer std.testing.allocator.free(path);
+//     const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "main.zig");
+//     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(std.testing.allocator, path, null);
-    defer graph.deinit();
+//     var graph = try ModuleGraph.init(std.testing.allocator, path, null);
+//     defer graph.deinit();
 
-    try std.testing.expectEqual(1, graph.moduleCount());
-    try std.testing.expectEqual(0, graph.zirCount());
-}
+//     try std.testing.expectEqual(1, graph.moduleCount());
+//     try std.testing.expectEqual(0, graph.zirCount());
+// }
