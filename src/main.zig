@@ -56,11 +56,21 @@ pub fn main() !u8 {
 
     const zig_lib_path = config.zig_lib_path orelse detectZigLibPath(allocator, &stderr.interface) catch null;
 
+    var total_timer = if (config.verbose) std.time.Timer.start() catch null else null;
+
     var total_issues: usize = 0;
     for (config.paths) |path| {
         const abs_path = std.fs.cwd().realpathAlloc(allocator, path) catch path;
         const project_root = findProjectRoot(abs_path);
         total_issues += try lintPath(allocator, path, zig_lib_path, &config, use_color, project_root, &stderr.interface);
+    }
+
+    if (config.verbose and total_timer != null) {
+        const total_ms = @as(f64, @floatFromInt(total_timer.?.read())) / 1_000_000.0;
+        const dim = if (use_color) "\x1b[2m" else "";
+        const cyan = if (use_color) "\x1b[36m" else "";
+        const reset = if (use_color) "\x1b[0m" else "";
+        try stderr.interface.print("\n{s}{s}Total time:{s} {s}{d:.2}ms{s}\n", .{ dim, cyan, reset, cyan, total_ms, reset });
     }
 
     return if (total_issues > 0) 1 else 0;
@@ -327,8 +337,12 @@ fn loadGitignore(allocator: std.mem.Allocator, dir: std.fs.Dir) ?[]const u8 {
 fn lintFile(allocator: std.mem.Allocator, path: []const u8, zig_lib_path: ?[]const u8, config: *const Config, use_color: bool, project_root: ?[]const u8, writer: *std.Io.Writer) !usize {
     var timer = if (config.verbose) std.time.Timer.start() catch null else null;
 
+    const dim = if (use_color) "\x1b[2m" else "";
+    const cyan = if (use_color) "\x1b[36m" else "";
+    const reset = if (use_color) "\x1b[0m" else "";
+
     if (config.verbose) {
-        try writer.print("[verbose] linting {s}\n", .{path});
+        try writer.print("{s}┌─ {s}{s}{s}\n", .{ dim, reset, path, reset });
     }
 
     const graph_start = if (timer) |*t| t.read() else 0;
@@ -339,7 +353,7 @@ fn lintFile(allocator: std.mem.Allocator, path: []const u8, zig_lib_path: ?[]con
 
     if (config.verbose and timer != null) {
         const elapsed = timer.?.read() - graph_start;
-        try writer.print("[verbose]   module graph: {d:.2}ms\n", .{@as(f64, @floatFromInt(elapsed)) / 1_000_000.0});
+        try writer.print("{s}│ module graph:  {s}{d:>7.2}ms{s}\n", .{ dim, cyan, @as(f64, @floatFromInt(elapsed)) / 1_000_000.0, reset });
     }
 
     const resolver_start = if (timer) |*t| t.read() else 0;
@@ -348,14 +362,14 @@ fn lintFile(allocator: std.mem.Allocator, path: []const u8, zig_lib_path: ?[]con
 
     if (config.verbose and timer != null) {
         const elapsed = timer.?.read() - resolver_start;
-        try writer.print("[verbose]   type resolver: {d:.2}ms\n", .{@as(f64, @floatFromInt(elapsed)) / 1_000_000.0});
+        try writer.print("{s}│ type resolver: {s}{d:>7.2}ms{s}\n", .{ dim, cyan, @as(f64, @floatFromInt(elapsed)) / 1_000_000.0, reset });
     }
 
     const result = try lintFileWithGraph(allocator, path, &graph, &resolver, config, use_color, project_root, writer);
 
     if (config.verbose and timer != null) {
         const total = timer.?.read();
-        try writer.print("[verbose]   total: {d:.2}ms\n", .{@as(f64, @floatFromInt(total)) / 1_000_000.0});
+        try writer.print("{s}└─ total:        {s}{d:>7.2}ms{s}\n", .{ dim, cyan, @as(f64, @floatFromInt(total)) / 1_000_000.0, reset });
     }
 
     return result;
@@ -386,17 +400,22 @@ fn lintFileWithGraph(allocator: std.mem.Allocator, path: []const u8, graph: *Mod
         return lintFileSimple(allocator, path, config, use_color, project_root, writer);
     };
 
+    const dim = if (use_color) "\x1b[2m" else "";
+    const cyan = if (use_color) "\x1b[36m" else "";
+    const reset = if (use_color) "\x1b[0m" else "";
+
     var linter: Linter = .initWithSemantics(allocator, mod.source, mod.path, resolver, mod.path, &config.file_config);
     defer linter.deinit();
 
     linter.verbose = config.verbose;
+    linter.use_color = use_color;
 
     var timer = if (config.verbose) std.time.Timer.start() catch null else null;
     linter.lint();
 
     if (config.verbose and timer != null) {
         const elapsed = timer.?.read();
-        try writer.print("[verbose]   linting: {d:.2}ms\n", .{@as(f64, @floatFromInt(elapsed)) / 1_000_000.0});
+        try writer.print("{s}│ linting:       {s}{d:>7.2}ms{s}\n", .{ dim, cyan, @as(f64, @floatFromInt(elapsed)) / 1_000_000.0, reset });
     }
 
     return writeDiagnostics(linter.diagnostics.items, config, use_color, project_root, writer);
@@ -404,7 +423,19 @@ fn lintFileWithGraph(allocator: std.mem.Allocator, path: []const u8, graph: *Mod
 
 fn writeDiagnostics(diagnostics: []const Linter.Diagnostic, config: *const Config, use_color: bool, project_root: ?[]const u8, writer: *std.Io.Writer) !usize {
     var count: usize = 0;
+    var rule_counts = std.AutoHashMap(rules.Rule, usize).init(std.heap.page_allocator);
+    defer rule_counts.deinit();
+
     for (diagnostics) |diag| {
+        // Track rule counts for verbose output
+        if (config.verbose) {
+            const entry = rule_counts.getOrPut(diag.rule) catch continue;
+            if (!entry.found_existing) {
+                entry.value_ptr.* = 0;
+            }
+            entry.value_ptr.* += 1;
+        }
+
         // Check CLI ignore list
         var ignored = false;
         for (config.ignored_rules) |ignored_rule| {
@@ -423,6 +454,20 @@ fn writeDiagnostics(diagnostics: []const Linter.Diagnostic, config: *const Confi
             count += 1;
         }
     }
+
+    // Print rule summary if verbose
+    if (config.verbose and rule_counts.count() > 0) {
+        const dim = if (use_color) "\x1b[2m" else "";
+        const yellow = if (use_color) "\x1b[33m" else "";
+        const reset = if (use_color) "\x1b[0m" else "";
+
+        try writer.print("{s}│ rules:{s}\n", .{ dim, reset });
+        var iter = rule_counts.iterator();
+        while (iter.next()) |entry| {
+            try writer.print("{s}│   {s}{s}{s}: {d}{s}\n", .{ dim, yellow, entry.key_ptr.code(), reset, entry.value_ptr.*, reset });
+        }
+    }
+
     return count;
 }
 

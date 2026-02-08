@@ -40,6 +40,7 @@ parent_map: []Ast.Node.OptionalIndex = &.{},
 /// Cache of (module_path, node) -> is_deprecated to avoid re-parsing doc comments
 deprecation_cache: std.AutoHashMapUnmanaged(DeprecationKey, bool) = .empty,
 verbose: bool = false,
+use_color: bool = false,
 
 const default_config: Config = .{};
 
@@ -147,6 +148,10 @@ pub fn deinit(self: *Linter) void {
 pub fn lint(self: *Linter) void {
     var timer = if (self.verbose) std.time.Timer.start() catch null else null;
 
+    const dim = if (self.use_color) "\x1b[2m" else "";
+    const cyan = if (self.use_color) "\x1b[36m" else "";
+    const reset = if (self.use_color) "\x1b[0m" else "";
+
     self.checkParseErrors();
     if (self.tree.errors.len > 0) return;
 
@@ -160,7 +165,7 @@ pub fn lint(self: *Linter) void {
 
     if (self.verbose and timer != null) {
         const elapsed = timer.?.read() - setup_start;
-        std.debug.print("[verbose]     setup: {d:.2}ms\n", .{@as(f64, @floatFromInt(elapsed)) / 1_000_000.0});
+        std.debug.print("{s}│   setup:       {s}{d:>7.2}ms{s}\n", .{ dim, cyan, @as(f64, @floatFromInt(elapsed)) / 1_000_000.0, reset });
     }
 
     const visit_start = if (timer) |*t| t.read() else 0;
@@ -170,7 +175,7 @@ pub fn lint(self: *Linter) void {
 
     if (self.verbose and timer != null) {
         const elapsed = timer.?.read() - visit_start;
-        std.debug.print("[verbose]     visit nodes: {d:.2}ms ({d} nodes)\n", .{ @as(f64, @floatFromInt(elapsed)) / 1_000_000.0, self.tree.nodes.len });
+        std.debug.print("{s}│   visit:       {s}{d:>7.2}ms{s} ({d} nodes)\n", .{ dim, cyan, @as(f64, @floatFromInt(elapsed)) / 1_000_000.0, reset, self.tree.nodes.len });
     }
 
     const checks_start = if (timer) |*t| t.read() else 0;
@@ -183,7 +188,7 @@ pub fn lint(self: *Linter) void {
 
     if (self.verbose and timer != null) {
         const elapsed = timer.?.read() - checks_start;
-        std.debug.print("[verbose]     final checks: {d:.2}ms\n", .{@as(f64, @floatFromInt(elapsed)) / 1_000_000.0});
+        std.debug.print("{s}│   checks:      {s}{d:>7.2}ms{s}\n", .{ dim, cyan, @as(f64, @floatFromInt(elapsed)) / 1_000_000.0, reset });
     }
 }
 
