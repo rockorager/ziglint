@@ -7,7 +7,7 @@ const TypeResolver = @import("TypeResolver.zig");
 const doc_comments = @import("doc_comments.zig");
 const Config = @import("Config.zig");
 
-const DeprecationKey = struct {
+pub const DeprecationKey = struct {
     module_path_hash: u64,
     node: Ast.Node.Index,
 
@@ -2202,17 +2202,18 @@ fn checkDefDeprecation(self: *Linter, def: TypeResolver.MethodDef, name_token: A
 
     // Not in cache, extract doc comment and cache the result
     const doc = doc_comments.getDocComment(self.allocator, &mod.tree, def.node) orelse {
-        // No doc comment, cache as not deprecated (ignore cache errors - non-critical)
-        self.deprecation_cache.put(self.allocator, cache_key, false) catch {};
+        // No doc comment, cache as not deprecated (cache failure is non-critical)
+        self.deprecation_cache.put(self.allocator, cache_key, false) catch return false;
         return false;
     };
     defer self.allocator.free(doc);
 
     const is_deprecated = containsDeprecated(doc);
-    // Cache the result (ignore cache errors - non-critical)
-    self.deprecation_cache.put(self.allocator, cache_key, is_deprecated) catch {};
 
     if (is_deprecated) {
+        // Cache before reporting (cache failure is non-critical)
+        self.deprecation_cache.put(self.allocator, cache_key, true) catch return true;
+
         const loc = self.tree.tokenLocation(0, name_token);
         const msg = std.fmt.allocPrint(self.allocator, "'{s}' is deprecated: {s}", .{ fn_name, doc }) catch return false;
         self.allocated_contexts.append(self.allocator, msg) catch {
@@ -2222,6 +2223,9 @@ fn checkDefDeprecation(self: *Linter, def: TypeResolver.MethodDef, name_token: A
         self.report(loc, .Z011, msg);
         return true;
     }
+
+    // Not deprecated, cache the result (cache failure is non-critical)
+    self.deprecation_cache.put(self.allocator, cache_key, false) catch return false;
     return false;
 }
 
