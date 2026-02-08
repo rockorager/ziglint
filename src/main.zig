@@ -265,9 +265,23 @@ fn lintDirectory(allocator: std.mem.Allocator, path: []const u8, zig_lib_path: ?
 
     if (files.items.len == 0) return 0;
 
+    const dim = if (use_color) "\x1b[2m" else "";
+    const cyan = if (use_color) "\x1b[36m" else "";
+    const reset = if (use_color) "\x1b[0m" else "";
+
+    if (config.verbose) {
+        try writer.print("{s}┌─ {s}{s}{s} ({d} files)\n", .{ dim, reset, path, reset, files.items.len });
+    }
+
+    var timer = if (config.verbose) std.time.Timer.start() catch null else null;
+
     // Build module graph once using first file as root, then add all others
+    const graph_start = if (timer) |*t| t.read() else 0;
     var graph = ModuleGraph.init(allocator, files.items[0], zig_lib_path) catch {
         // Fall back to per-file linting without semantics
+        if (config.verbose) {
+            try writer.print("{s}│ module graph failed, using simple linting{s}\n", .{ dim, reset });
+        }
         var total: usize = 0;
         for (files.items) |file_path| {
             total += try lintFileSimple(allocator, file_path, config, use_color, project_root, writer);
@@ -276,17 +290,39 @@ fn lintDirectory(allocator: std.mem.Allocator, path: []const u8, zig_lib_path: ?
     };
     defer graph.deinit();
 
+    if (config.verbose and timer != null) {
+        const elapsed = timer.?.read() - graph_start;
+        try writer.print("{s}│ module graph:  {s}{d:>7.2}ms{s}\n", .{ dim, cyan, @as(f64, @floatFromInt(elapsed)) / 1_000_000.0, reset });
+    }
+
     // Add remaining files to the graph
+    const add_start = if (timer) |*t| t.read() else 0;
     for (files.items[1..]) |file_path| {
         graph.addModulePublic(file_path);
     }
 
+    if (config.verbose and timer != null and files.items.len > 1) {
+        const elapsed = timer.?.read() - add_start;
+        try writer.print("{s}│ add files:     {s}{d:>7.2}ms{s} ({d} files)\n", .{ dim, cyan, @as(f64, @floatFromInt(elapsed)) / 1_000_000.0, reset, files.items.len - 1 });
+    }
+
+    const resolver_start = if (timer) |*t| t.read() else 0;
     var resolver: TypeResolver = .init(allocator, &graph);
     defer resolver.deinit();
+
+    if (config.verbose and timer != null) {
+        const elapsed = timer.?.read() - resolver_start;
+        try writer.print("{s}│ type resolver: {s}{d:>7.2}ms{s}\n", .{ dim, cyan, @as(f64, @floatFromInt(elapsed)) / 1_000_000.0, reset });
+    }
 
     var total: usize = 0;
     for (files.items) |file_path| {
         total += try lintFileWithGraph(allocator, file_path, &graph, &resolver, config, use_color, project_root, writer);
+    }
+
+    if (config.verbose and timer != null) {
+        const total_time = timer.?.read();
+        try writer.print("{s}└─ total:        {s}{d:>7.2}ms{s}\n", .{ dim, cyan, @as(f64, @floatFromInt(total_time)) / 1_000_000.0, reset });
     }
 
     return total;
