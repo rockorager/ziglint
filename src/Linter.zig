@@ -1504,7 +1504,13 @@ fn visitChildren(self: *Linter, node: Ast.Node.Index) void {
                 self.visitNode(member);
             }
         },
-        else => {},
+        else => {
+            // For all other node types, use getNodeChildren to visit children
+            const children = self.getNodeChildren(node);
+            for (children.slice()) |child| {
+                self.visitNode(child);
+            }
+        },
     }
 }
 
@@ -3867,8 +3873,6 @@ test "Z011: deprecated stdlib corpus - real Zig 0.15.2 deprecations" {
             \\}
             ,
             .expected_count = 1,
-            .skip = true,
-            .skip_reason = "getDocComment returns null for functions in std.meta",
         },
         .{
             .name = "std.meta.TagPayload",
@@ -3893,8 +3897,6 @@ test "Z011: deprecated stdlib corpus - real Zig 0.15.2 deprecations" {
             \\}
             ,
             .expected_count = 1,
-            .skip = true,
-            .skip_reason = "getDocComment returns null for functions in std.meta",
         },
         .{
             .name = "std.enums.nameCast",
@@ -3907,8 +3909,6 @@ test "Z011: deprecated stdlib corpus - real Zig 0.15.2 deprecations" {
             \\}
             ,
             .expected_count = 1,
-            .skip = true,
-            .skip_reason = "getDocComment returns null for functions in std.enums",
         },
         .{
             .name = "std.unicode.utf8Decode",
@@ -3920,8 +3920,6 @@ test "Z011: deprecated stdlib corpus - real Zig 0.15.2 deprecations" {
             \\}
             ,
             .expected_count = 1,
-            .skip = true,
-            .skip_reason = "getDocComment returns null for functions in std.unicode",
         },
         .{
             .name = "std.Io.null_writer",
@@ -3957,7 +3955,7 @@ test "Z011: deprecated stdlib corpus - real Zig 0.15.2 deprecations" {
             ,
             .expected_count = 1,
             .skip = true,
-            .skip_reason = "getDocComment returns null for methods in std.fs.File",
+            .skip_reason = "TypeResolver cannot resolve types of local variables (requires flow analysis)",
         },
         .{
             .name = "std.fs.File.deprecatedReader",
@@ -3971,7 +3969,7 @@ test "Z011: deprecated stdlib corpus - real Zig 0.15.2 deprecations" {
             ,
             .expected_count = 1,
             .skip = true,
-            .skip_reason = "getDocComment returns null for methods in std.fs.File",
+            .skip_reason = "TypeResolver cannot resolve types of local variables (requires flow analysis)",
         },
     };
 
