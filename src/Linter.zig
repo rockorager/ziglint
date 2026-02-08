@@ -6,6 +6,7 @@ const rules = @import("rules.zig");
 const TypeResolver = @import("TypeResolver.zig");
 const doc_comments = @import("doc_comments.zig");
 const Config = @import("Config.zig");
+const ModuleGraph = @import("ModuleGraph.zig");
 
 pub const DeprecationKey = struct {
     module_path_hash: u64,
@@ -2789,7 +2790,7 @@ fn isIgnored(self: *Linter, line: usize, rule: rules.Rule) bool {
     while (check_line > 0) {
         check_line -= 1;
         const prev_line = self.getLineText(check_line);
-        const trimmed = std.mem.trimLeft(u8, prev_line, " \t");
+        const trimmed = std.mem.trimStart(u8, prev_line, " \t");
         if (!std.mem.startsWith(u8, trimmed, "//")) break;
         if (self.lineHasIgnore(prev_line, rule)) return true;
     }
@@ -3483,7 +3484,6 @@ test "Z010: allow field access on non-type (self.field)" {
 }
 
 test "Z011: detect deprecated method call" {
-    const ModuleGraph = @import("ModuleGraph.zig");
     const source =
         \\const MyType = struct {
         \\    value: u32 = 0,
@@ -3527,7 +3527,6 @@ test "Z011: detect deprecated method call" {
 }
 
 test "Z011: no warning for non-deprecated method" {
-    const ModuleGraph = @import("ModuleGraph.zig");
     const source =
         \\const MyType = struct {
         \\    value: u32,
@@ -3587,7 +3586,6 @@ test "Z011: without semantic context, no Z011 warnings" {
 }
 
 test "Z011: detect deprecated direct function call" {
-    const ModuleGraph = @import("ModuleGraph.zig");
     const source =
         \\/// Deprecated: use newFunc instead
         \\pub fn oldFunc() void {}
@@ -3625,7 +3623,6 @@ test "Z011: detect deprecated direct function call" {
 }
 
 test "Z011: detect deprecated function alias" {
-    const ModuleGraph = @import("ModuleGraph.zig");
     const source =
         \\/// Deprecated: use newFunc instead
         \\pub fn oldFunc() void {}
@@ -3664,7 +3661,6 @@ test "Z011: detect deprecated function alias" {
 }
 
 test "Z011: detect deprecated type function" {
-    const ModuleGraph = @import("ModuleGraph.zig");
     const source =
         \\/// Deprecated: use NewList instead
         \\pub fn OldList(comptime T: type) type {
@@ -3704,7 +3700,6 @@ test "Z011: detect deprecated type function" {
 }
 
 test "Z011: detect deprecated type function alias" {
-    const ModuleGraph = @import("ModuleGraph.zig");
     const source =
         \\/// Deprecated: use NewList instead
         \\pub fn OldList(comptime T: type) type {
@@ -3745,7 +3740,6 @@ test "Z011: detect deprecated type function alias" {
 }
 
 test "Z011: detect deprecated stdlib function (ArrayListUnmanaged)" {
-    const ModuleGraph = @import("ModuleGraph.zig");
 
     // Detect zig lib path by running zig env
     const zig_lib_path = blk: {
@@ -3812,7 +3806,6 @@ test "Z011: detect deprecated stdlib function (ArrayListUnmanaged)" {
 }
 
 test "Z011: deprecated stdlib corpus - real Zig 0.15.2 deprecations" {
-    const ModuleGraph = @import("ModuleGraph.zig");
 
     // Detect zig lib path by running zig env
     const zig_lib_path = blk: {
@@ -4669,7 +4662,6 @@ test "Z023: argument order - aliased Allocator" {
     const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
     defer std.testing.allocator.free(path);
 
-    const ModuleGraph = @import("ModuleGraph.zig");
     var graph = try ModuleGraph.init(std.testing.allocator, path, null);
     defer graph.deinit();
 
@@ -4703,7 +4695,6 @@ test "Z023: argument order - aliased Io" {
     const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
     defer std.testing.allocator.free(path);
 
-    const ModuleGraph = @import("ModuleGraph.zig");
     var graph = try ModuleGraph.init(std.testing.allocator, path, null);
     defer graph.deinit();
 
@@ -4771,7 +4762,6 @@ test "Z023: receiver param with struct name is ok (semantic)" {
     const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
     defer std.testing.allocator.free(path);
 
-    const ModuleGraph = @import("ModuleGraph.zig");
     var graph = try ModuleGraph.init(std.testing.allocator, path, null);
     defer graph.deinit();
 
@@ -4803,7 +4793,6 @@ test "Z023: file-as-struct receiver is ok (semantic)" {
     const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "Terminal.zig");
     defer std.testing.allocator.free(path);
 
-    const ModuleGraph = @import("ModuleGraph.zig");
     var graph = try ModuleGraph.init(std.testing.allocator, path, null);
     defer graph.deinit();
 
@@ -5156,7 +5145,6 @@ test "Z026: detect multiple empty catches" {
 }
 
 test "Z027: flag instance accessing const" {
-    const ModuleGraph = @import("ModuleGraph.zig");
     const source =
         \\const Foo = struct {
         \\    field: u32,
@@ -5197,7 +5185,6 @@ test "Z027: flag instance accessing const" {
 }
 
 test "Z027: flag instance accessing static fn" {
-    const ModuleGraph = @import("ModuleGraph.zig");
     const source =
         \\const Foo = struct {
         \\    field: u32,
@@ -5238,7 +5225,6 @@ test "Z027: flag instance accessing static fn" {
 }
 
 test "Z027: allow instance method call" {
-    const ModuleGraph = @import("ModuleGraph.zig");
     const source =
         \\const Foo = struct {
         \\    field: u32,
@@ -5278,7 +5264,6 @@ test "Z027: allow instance method call" {
 }
 
 test "Z027: allow field access" {
-    const ModuleGraph = @import("ModuleGraph.zig");
     const source =
         \\const Foo = struct {
         \\    field: u32,
@@ -5315,7 +5300,6 @@ test "Z027: allow field access" {
 }
 
 test "Z027: allow type-level access" {
-    const ModuleGraph = @import("ModuleGraph.zig");
     const source =
         \\const Foo = struct {
         \\    field: u32,
@@ -5371,7 +5355,6 @@ test "Z027: no warning without semantic context" {
 }
 
 test "Z027: allow method with Self receiver" {
-    const ModuleGraph = @import("ModuleGraph.zig");
     const source =
         \\const Foo = struct {
         \\    const Self = @This();
@@ -5412,7 +5395,6 @@ test "Z027: allow method with Self receiver" {
 }
 
 test "Z027: allow method with named type receiver" {
-    const ModuleGraph = @import("ModuleGraph.zig");
     const source =
         \\const Foo = struct {
         \\    field: u32,
@@ -5504,7 +5486,6 @@ test "Z029: allow @as with different type in array init" {
 }
 
 test "Z029: detect redundant @as in method call arg" {
-    const ModuleGraph = @import("ModuleGraph.zig");
     const source =
         \\const MyType = struct {
         \\    value: u32,
