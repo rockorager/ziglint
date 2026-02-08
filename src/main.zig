@@ -16,6 +16,7 @@ pub const Config = struct {
     paths: []const []const u8 = &.{},
     ignored_rules: []const rules.Rule = &.{},
     file_config: FileConfig = .{},
+    verbose: bool = false,
 };
 
 pub fn main() !u8 {
@@ -139,6 +140,8 @@ fn parseArgs(allocator: std.mem.Allocator, writer: *std.Io.Writer) !Config {
                 try writer.print("error: unknown rule code '{s}'\n", .{args[i]});
                 return error.InvalidArgs;
             }
+        } else if (std.mem.eql(u8, arg, "--verbose")) {
+            config.verbose = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try printUsage(writer);
             return error.HelpOrVersion;
@@ -322,15 +325,40 @@ fn loadGitignore(allocator: std.mem.Allocator, dir: std.fs.Dir) ?[]const u8 {
 }
 
 fn lintFile(allocator: std.mem.Allocator, path: []const u8, zig_lib_path: ?[]const u8, config: *const Config, use_color: bool, project_root: ?[]const u8, writer: *std.Io.Writer) !usize {
+    var timer = if (config.verbose) std.time.Timer.start() catch null else null;
+
+    if (config.verbose) {
+        try writer.print("[verbose] linting {s}\n", .{path});
+    }
+
+    const graph_start = if (timer) |*t| t.read() else 0;
     var graph = ModuleGraph.init(allocator, path, zig_lib_path) catch {
         return lintFileSimple(allocator, path, config, use_color, project_root, writer);
     };
     defer graph.deinit();
 
+    if (config.verbose and timer != null) {
+        const elapsed = timer.?.read() - graph_start;
+        try writer.print("[verbose]   module graph: {d:.2}ms\n", .{@as(f64, @floatFromInt(elapsed)) / 1_000_000.0});
+    }
+
+    const resolver_start = if (timer) |*t| t.read() else 0;
     var resolver: TypeResolver = .init(allocator, &graph);
     defer resolver.deinit();
 
-    return lintFileWithGraph(allocator, path, &graph, &resolver, config, use_color, project_root, writer);
+    if (config.verbose and timer != null) {
+        const elapsed = timer.?.read() - resolver_start;
+        try writer.print("[verbose]   type resolver: {d:.2}ms\n", .{@as(f64, @floatFromInt(elapsed)) / 1_000_000.0});
+    }
+
+    const result = try lintFileWithGraph(allocator, path, &graph, &resolver, config, use_color, project_root, writer);
+
+    if (config.verbose and timer != null) {
+        const total = timer.?.read();
+        try writer.print("[verbose]   total: {d:.2}ms\n", .{@as(f64, @floatFromInt(total)) / 1_000_000.0});
+    }
+
+    return result;
 }
 
 fn lintFileSimple(allocator: std.mem.Allocator, path: []const u8, config: *const Config, use_color: bool, project_root: ?[]const u8, writer: *std.Io.Writer) !usize {
@@ -361,7 +389,15 @@ fn lintFileWithGraph(allocator: std.mem.Allocator, path: []const u8, graph: *Mod
     var linter: Linter = .initWithSemantics(allocator, mod.source, mod.path, resolver, mod.path, &config.file_config);
     defer linter.deinit();
 
+    linter.verbose = config.verbose;
+
+    var timer = if (config.verbose) std.time.Timer.start() catch null else null;
     linter.lint();
+
+    if (config.verbose and timer != null) {
+        const elapsed = timer.?.read();
+        try writer.print("[verbose]   linting: {d:.2}ms\n", .{@as(f64, @floatFromInt(elapsed)) / 1_000_000.0});
+    }
 
     return writeDiagnostics(linter.diagnostics.items, config, use_color, project_root, writer);
 }
@@ -400,6 +436,7 @@ fn printUsage(writer: *std.Io.Writer) !void {
         \\  --ignore <rule>       Ignore a rule (e.g., Z001). Can be repeated.
         \\  --zig-lib-path <path> Override the path to the Zig standard library.
         \\                        Auto-detected from 'zig env' if not specified.
+        \\  --verbose             Show detailed timing and progress information.
         \\  -h, --help            Show this help message.
         \\  -v, --version         Show version.
         \\

@@ -39,6 +39,7 @@ current_fn_return_type: Ast.Node.OptionalIndex = .none,
 parent_map: []Ast.Node.OptionalIndex = &.{},
 /// Cache of (module_path, node) -> is_deprecated to avoid re-parsing doc comments
 deprecation_cache: std.AutoHashMapUnmanaged(DeprecationKey, bool) = .empty,
+verbose: bool = false,
 
 const default_config: Config = .{};
 
@@ -144,25 +145,46 @@ pub fn deinit(self: *Linter) void {
 }
 
 pub fn lint(self: *Linter) void {
+    var timer = if (self.verbose) std.time.Timer.start() catch null else null;
+
     self.checkParseErrors();
     if (self.tree.errors.len > 0) return;
 
     self.checkLineLength();
     self.checkFileAsStruct();
+
+    const setup_start = if (timer) |*t| t.read() else 0;
     self.buildPublicTypesMap();
     self.collectAllIdentifiers();
     self.buildParentMap();
 
+    if (self.verbose and timer != null) {
+        const elapsed = timer.?.read() - setup_start;
+        std.debug.print("[verbose]     setup: {d:.2}ms\n", .{@as(f64, @floatFromInt(elapsed)) / 1_000_000.0});
+    }
+
+    const visit_start = if (timer) |*t| t.read() else 0;
     for (self.tree.rootDecls()) |node| {
         self.visitNode(node);
     }
 
+    if (self.verbose and timer != null) {
+        const elapsed = timer.?.read() - visit_start;
+        std.debug.print("[verbose]     visit nodes: {d:.2}ms ({d} nodes)\n", .{ @as(f64, @floatFromInt(elapsed)) / 1_000_000.0, self.tree.nodes.len });
+    }
+
+    const checks_start = if (timer) |*t| t.read() else 0;
     self.checkUnusedImports();
     self.checkThisBuiltin();
     self.checkInlineImports();
     self.checkCatchReturnAll();
     self.checkEmptyCatchAll();
     self.checkInstanceDeclAccess();
+
+    if (self.verbose and timer != null) {
+        const elapsed = timer.?.read() - checks_start;
+        std.debug.print("[verbose]     final checks: {d:.2}ms\n", .{@as(f64, @floatFromInt(elapsed)) / 1_000_000.0});
+    }
 }
 
 fn collectAllIdentifiers(self: *Linter) void {
