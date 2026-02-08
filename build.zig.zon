@@ -1,6 +1,6 @@
 .{
     .name = .ziglint,
-    .version = "0.5.0",
+    .version = "0.5.1",
     .fingerprint = 0x4b7deecc2ff046b7,
     .paths = .{
         "build.zig",
