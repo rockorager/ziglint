@@ -41,6 +41,9 @@ parent_map: []Ast.Node.OptionalIndex = &.{},
 deprecation_cache: std.AutoHashMapUnmanaged(DeprecationKey, bool) = .empty,
 verbose: bool = false,
 use_color: bool = false,
+/// Track time spent checking each rule type (nanoseconds)
+rule_timings: std.AutoHashMapUnmanaged(rules.Rule, u64) = .empty,
+rule_timer: ?std.time.Timer = null,
 
 const default_config: Config = .{};
 
@@ -139,6 +142,7 @@ pub fn deinit(self: *Linter) void {
     self.import_bindings.deinit(self.allocator);
     self.used_identifiers.deinit(self.allocator);
     self.deprecation_cache.deinit(self.allocator);
+    self.rule_timings.deinit(self.allocator);
     if (self.parent_map.len > 0) {
         self.allocator.free(self.parent_map);
     }
@@ -147,9 +151,13 @@ pub fn deinit(self: *Linter) void {
 
 pub fn lint(self: *Linter) void {
     var timer = if (self.verbose) std.time.Timer.start() catch null else null;
+    if (self.verbose) {
+        self.rule_timer = std.time.Timer.start() catch null;
+    }
 
     const dim = if (self.use_color) "\x1b[2m" else "";
     const cyan = if (self.use_color) "\x1b[36m" else "";
+    const yellow = if (self.use_color) "\x1b[33m" else "";
     const reset = if (self.use_color) "\x1b[0m" else "";
 
     self.checkParseErrors();
@@ -190,6 +198,47 @@ pub fn lint(self: *Linter) void {
         const elapsed = timer.?.read() - checks_start;
         std.debug.print("{s}│   checks:      {s}{d:>7.2}ms{s}\n", .{ dim, cyan, @as(f64, @floatFromInt(elapsed)) / 1_000_000.0, reset });
     }
+
+    // Print per-rule timing breakdown if verbose
+    if (self.verbose and self.rule_timings.count() > 0) {
+        std.debug.print("{s}│   rules:{s}\n", .{ dim, reset });
+
+        // Sort rules by time spent (descending)
+        const Entry = struct { rule: rules.Rule, time_ns: u64 };
+        var entries: std.ArrayList(Entry) = .empty;
+        defer entries.deinit(self.allocator);
+
+        var iter = self.rule_timings.iterator();
+        while (iter.next()) |entry| {
+            entries.append(self.allocator, .{ .rule = entry.key_ptr.*, .time_ns = entry.value_ptr.* }) catch continue;
+        }
+
+        // Simple bubble sort by time (descending)
+        for (0..entries.items.len) |i| {
+            for (i + 1..entries.items.len) |j| {
+                if (entries.items[j].time_ns > entries.items[i].time_ns) {
+                    const tmp = entries.items[i];
+                    entries.items[i] = entries.items[j];
+                    entries.items[j] = tmp;
+                }
+            }
+        }
+
+        for (entries.items) |entry| {
+            const time_ms = @as(f64, @floatFromInt(entry.time_ns)) / 1_000_000.0;
+            std.debug.print("{s}│     {s}{s}{s}: {s}{d:>7.2}ms{s}\n", .{ dim, yellow, entry.rule.code(), reset, cyan, time_ms, reset });
+        }
+    }
+}
+
+fn trackRuleTime(self: *Linter, rule: rules.Rule, time_ns: u64) void {
+    if (!self.verbose) return;
+
+    const entry = self.rule_timings.getOrPut(self.allocator, rule) catch return;
+    if (!entry.found_existing) {
+        entry.value_ptr.* = 0;
+    }
+    entry.value_ptr.* += time_ns;
 }
 
 fn collectAllIdentifiers(self: *Linter) void {
@@ -1351,8 +1400,22 @@ fn visitNode(self: *Linter, node: Ast.Node.Index) void {
         .call_one, .call_one_comma, .call, .call_comma => {
             self.checkCallArgs(node);
             self.checkRedundantAsInCallArgs(node);
-            self.checkDeprecatedCall(node);
-            self.checkCompoundAssert(node);
+
+            if (self.rule_timer != null) {
+                const deprecated_start = self.rule_timer.?.read();
+                self.checkDeprecatedCall(node);
+                self.trackRuleTime(.Z011, self.rule_timer.?.read() - deprecated_start);
+            } else {
+                self.checkDeprecatedCall(node);
+            }
+
+            if (self.rule_timer != null) {
+                const assert_start = self.rule_timer.?.read();
+                self.checkCompoundAssert(node);
+                self.trackRuleTime(.Z016, self.rule_timer.?.read() - assert_start);
+            } else {
+                self.checkCompoundAssert(node);
+            }
         },
         .array_init_one,
         .array_init_one_comma,
@@ -1789,7 +1852,15 @@ fn checkDupeImport(self: *Linter, var_decl: Ast.full.VarDecl, name_token: Ast.To
 fn checkReturn(self: *Linter, node: Ast.Node.Index) void {
     const return_expr = self.tree.nodeData(node).opt_node.unwrap() orelse return;
     self.checkRedundantType(return_expr, true);
-    self.checkReturnTry(node, return_expr);
+
+    if (self.rule_timer) |*t| {
+        const start = t.read();
+        self.checkReturnTry(node, return_expr);
+        self.trackRuleTime(.Z017, t.read() - start);
+    } else {
+        self.checkReturnTry(node, return_expr);
+    }
+
     self.checkRedundantAsInReturn(node, return_expr);
 }
 
