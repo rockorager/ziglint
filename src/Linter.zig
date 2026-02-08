@@ -3842,6 +3842,8 @@ test "Z011: deprecated stdlib corpus - real Zig 0.15.2 deprecations" {
         name: []const u8,
         source: [:0]const u8,
         expected_count: usize, // Minimum number of Z011 warnings expected
+        skip: bool = false, // Skip test if true (for known issues)
+        skip_reason: []const u8 = "",
     }{
         .{
             .name = "std.mem.copyBackwards",
@@ -3864,7 +3866,9 @@ test "Z011: deprecated stdlib corpus - real Zig 0.15.2 deprecations" {
             \\    _ = try std.meta.intToEnum(MyEnum, 1);
             \\}
             ,
-            .expected_count = 0, // TODO: Not yet detected - needs investigation
+            .expected_count = 1,
+            .skip = true,
+            .skip_reason = "getDocComment returns null for functions in std.meta",
         },
         .{
             .name = "std.meta.TagPayload",
@@ -3879,6 +3883,47 @@ test "Z011: deprecated stdlib corpus - real Zig 0.15.2 deprecations" {
             .expected_count = 1,
         },
         .{
+            .name = "std.meta.TagPayloadByName",
+            .source =
+            \\const std = @import("std");
+            \\const U = union(enum) { a: u32, b: []const u8 };
+            \\pub fn main() void {
+            \\    const T = std.meta.TagPayloadByName(U, "a");
+            \\    _ = T;
+            \\}
+            ,
+            .expected_count = 1,
+            .skip = true,
+            .skip_reason = "getDocComment returns null for functions in std.meta",
+        },
+        .{
+            .name = "std.enums.nameCast",
+            .source =
+            \\const std = @import("std");
+            \\const E = enum { foo, bar };
+            \\pub fn main() void {
+            \\    const e = std.enums.nameCast(E, .foo);
+            \\    _ = e;
+            \\}
+            ,
+            .expected_count = 1,
+            .skip = true,
+            .skip_reason = "getDocComment returns null for functions in std.enums",
+        },
+        .{
+            .name = "std.unicode.utf8Decode",
+            .source =
+            \\const std = @import("std");
+            \\pub fn main() !void {
+            \\    const bytes = "x";
+            \\    _ = try std.unicode.utf8Decode(bytes);
+            \\}
+            ,
+            .expected_count = 1,
+            .skip = true,
+            .skip_reason = "getDocComment returns null for functions in std.unicode",
+        },
+        .{
             .name = "std.Io.null_writer",
             .source =
             \\const std = @import("std");
@@ -3886,7 +3931,9 @@ test "Z011: deprecated stdlib corpus - real Zig 0.15.2 deprecations" {
             \\    _ = std.Io.null_writer;
             \\}
             ,
-            .expected_count = 0, // TODO: This is a const value, not a function call
+            .expected_count = 1,
+            .skip = true,
+            .skip_reason = "const value, not a function call - requires different detection",
         },
         .{
             .name = "std.ArrayListAligned",
@@ -3898,12 +3945,45 @@ test "Z011: deprecated stdlib corpus - real Zig 0.15.2 deprecations" {
             ,
             .expected_count = 1,
         },
+        .{
+            .name = "std.fs.File.readToEndAlloc",
+            .source =
+            \\const std = @import("std");
+            \\pub fn main() !void {
+            \\    const file = try std.fs.cwd().openFile("test.txt", .{});
+            \\    defer file.close();
+            \\    _ = try file.readToEndAlloc(std.heap.page_allocator, 1024);
+            \\}
+            ,
+            .expected_count = 1,
+            .skip = true,
+            .skip_reason = "getDocComment returns null for methods in std.fs.File",
+        },
+        .{
+            .name = "std.fs.File.deprecatedReader",
+            .source =
+            \\const std = @import("std");
+            \\pub fn main() !void {
+            \\    const file = try std.fs.cwd().openFile("test.txt", .{});
+            \\    defer file.close();
+            \\    _ = file.deprecatedReader();
+            \\}
+            ,
+            .expected_count = 1,
+            .skip = true,
+            .skip_reason = "getDocComment returns null for methods in std.fs.File",
+        },
     };
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
     for (test_cases) |tc| {
+        if (tc.skip) {
+            std.debug.print("Test case '{s}': SKIP ({s})\n", .{ tc.name, tc.skip_reason });
+            continue;
+        }
+
         try tmp_dir.dir.writeFile(.{ .sub_path = "test.zig", .data = tc.source });
         const path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, "test.zig");
         defer std.testing.allocator.free(path);
