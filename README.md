@@ -15,6 +15,7 @@ Directories are scanned recursively for `.zig` files.
 ### Options
 
 - `--zig-lib-path <path>` - Override the path to the Zig standard library (auto-detected from `zig env` if not specified)
+- `--only <rule>` - Lint only the specified rule (e.g., `Z001`). Can be repeated.
 - `--ignore <rule>` - Ignore a rule (e.g., `Z001`). Can be repeated.
 - `-h, --help` - Show help message
 
