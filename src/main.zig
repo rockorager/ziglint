@@ -14,6 +14,7 @@ const TypeResolver = @import("TypeResolver.zig");
 pub const Config = struct {
     zig_lib_path: ?[]const u8 = null,
     paths: []const []const u8 = &.{},
+    only_rules: []const rules.Rule = &.{},
     ignored_rules: []const rules.Rule = &.{},
     file_config: FileConfig = .{},
     verbose: bool = false,
@@ -44,6 +45,8 @@ pub fn main() !u8 {
     // Load config file from first CLI path (or current directory)
     const start_path = if (config.paths.len > 0) config.paths[0] else null;
     config.file_config = FileConfig.load(allocator, start_path) catch .{};
+
+    applyOnlyRules(&config);
 
     // Use CLI paths, then config file paths, then default to "."
     if (config.paths.len == 0) {
@@ -126,6 +129,7 @@ fn parseArgs(allocator: std.mem.Allocator, writer: *std.Io.Writer) !Config {
 
     var config: Config = .{};
     var paths: std.ArrayList([]const u8) = .empty;
+    var only_rules: std.ArrayList(rules.Rule) = .empty;
     var ignored_rules: std.ArrayList(rules.Rule) = .empty;
 
     var i: usize = 1;
@@ -138,6 +142,18 @@ fn parseArgs(allocator: std.mem.Allocator, writer: *std.Io.Writer) !Config {
                 return error.InvalidArgs;
             }
             config.zig_lib_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--only")) {
+            i += 1;
+            if (i >= args.len) {
+                try writer.writeAll("error: --only requires a rule code (e.g., Z001)\n");
+                return error.InvalidArgs;
+            }
+            if (parseRuleCode(args[i])) |rule| {
+                try only_rules.append(allocator, rule);
+            } else {
+                try writer.print("error: unknown rule code '{s}'\n", .{args[i]});
+                return error.InvalidArgs;
+            }
         } else if (std.mem.eql(u8, arg, "--ignore")) {
             i += 1;
             if (i >= args.len) {
@@ -167,6 +183,7 @@ fn parseArgs(allocator: std.mem.Allocator, writer: *std.Io.Writer) !Config {
     }
 
     config.paths = paths.items;
+    config.only_rules = only_rules.items;
     config.ignored_rules = ignored_rules.items;
     return config;
 }
@@ -178,6 +195,24 @@ fn parseRuleCode(code: []const u8) ?rules.Rule {
         }
     }
     return null;
+}
+
+fn applyOnlyRules(config: *Config) void {
+    if (config.only_rules.len == 0) return;
+
+    inline for (std.meta.fields(rules.Rule)) |field| {
+        const rule: rules.Rule = @enumFromInt(field.value);
+        config.file_config.setRuleEnabled(rule, false);
+    }
+
+    for (config.only_rules) |rule| {
+        config.file_config.setRuleEnabled(rule, true);
+    }
+
+    // Keep --ignore behavior consistent when used with --only.
+    for (config.ignored_rules) |rule| {
+        config.file_config.setRuleEnabled(rule, false);
+    }
 }
 
 fn detectZigLibPath(allocator: std.mem.Allocator, writer: *std.Io.Writer) !?[]const u8 {
@@ -514,6 +549,7 @@ fn printUsage(writer: *std.Io.Writer) !void {
         \\Lint Zig source files for style and correctness issues.
         \\
         \\Options:
+        \\  --only <rule>         Lint only this rule (e.g., Z001). Can be repeated.
         \\  --ignore <rule>       Ignore a rule (e.g., Z001). Can be repeated.
         \\  --zig-lib-path <path> Override the path to the Zig standard library.
         \\                        Auto-detected from 'zig env' if not specified.
@@ -556,4 +592,29 @@ test "parseLibDirFromZigEnv" {
 test "parseLibDirFromZigEnv: missing field" {
     const output = ".{ .zig_exe = \"/usr/bin/zig\" }";
     try std.testing.expectEqual(null, parseLibDirFromZigEnv(std.testing.allocator, output));
+}
+
+test "applyOnlyRules enables selected rules" {
+    var config: Config = .{
+        .only_rules = &.{ .Z001, .Z033 },
+    };
+
+    applyOnlyRules(&config);
+
+    try std.testing.expect(config.file_config.isRuleEnabled(.Z001));
+    try std.testing.expect(config.file_config.isRuleEnabled(.Z033));
+    try std.testing.expect(!config.file_config.isRuleEnabled(.Z002));
+}
+
+test "applyOnlyRules keeps ignore precedence" {
+    var config: Config = .{
+        .only_rules = &.{ .Z001, .Z002 },
+        .ignored_rules = &.{.Z002},
+    };
+
+    applyOnlyRules(&config);
+
+    try std.testing.expect(config.file_config.isRuleEnabled(.Z001));
+    try std.testing.expect(!config.file_config.isRuleEnabled(.Z002));
+    try std.testing.expect(!config.file_config.isRuleEnabled(.Z003));
 }

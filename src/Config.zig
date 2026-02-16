@@ -28,6 +28,16 @@ pub fn isRuleEnabled(self: *const Config, rule: Rule) bool {
     return true;
 }
 
+/// Set whether a rule is enabled.
+pub fn setRuleEnabled(self: *Config, rule: Rule, enabled: bool) void {
+    inline for (@typeInfo(Rule).@"enum".fields) |field| {
+        if (field.value == @intFromEnum(rule)) {
+            @field(self.rules, field.name).enabled = enabled;
+            return;
+        }
+    }
+}
+
 /// Load config from .ziglint.zon file, searching from start_path up to root.
 pub fn load(allocator: std.mem.Allocator, start_path: ?[]const u8) !Config {
     const config_path = try findConfigFile(allocator, start_path) orelse return .{};
@@ -160,6 +170,18 @@ test "runtime rule check" {
     const config: Config = .{};
     const rule: Rule = .Z001;
     try std.testing.expect(config.isRuleEnabled(rule));
+}
+
+test "set rule enabled" {
+    var config: Config = .{};
+
+    try std.testing.expect(!config.isRuleEnabled(.Z033));
+    config.setRuleEnabled(.Z033, true);
+    try std.testing.expect(config.isRuleEnabled(.Z033));
+
+    try std.testing.expect(config.isRuleEnabled(.Z001));
+    config.setRuleEnabled(.Z001, false);
+    try std.testing.expect(!config.isRuleEnabled(.Z001));
 }
 
 test "parse paths config" {
