@@ -1622,8 +1622,24 @@ fn checkDeinitUndefined(self: *Linter, node: Ast.Node.Index, fn_proto: Ast.full.
     // Get function body
     const body_node = self.tree.nodeData(node).node_and_node[1];
 
-    // Check for `defer self.* = undefined;` anywhere in body - this handles all paths
-    if (self.hasDeferSelfUndefined(body_node, param_name)) return;
+    const has_deferred_invalidation = self.hasDeferSelfUndefined(body_node, param_name);
+    const lifetime = self.analyzeReceiverLifetime(body_node, param_name, false);
+
+    // A deferred write would run after the receiver's allocation is freed.
+    if (lifetime.deferred_invalidation_after_destroy) {
+        const loc = self.tree.tokenLocation(0, name_token);
+        self.reportDeinitUndefined(loc, param_name, "deferred invalidation runs after receiver destruction");
+        return;
+    }
+
+    if (lifetime.invalidation_after_destroy) {
+        const loc = self.tree.tokenLocation(0, name_token);
+        self.reportDeinitUndefined(loc, param_name, "invalidates receiver after destruction");
+        return;
+    }
+
+    // `defer self.* = undefined;` handles every path that reaches the defer.
+    if (has_deferred_invalidation) return;
 
     // Check for returns reached before this receiver is invalidated.
     if (self.hasUnsafeReturn(body_node, param_name, false)) {
@@ -1632,7 +1648,10 @@ fn checkDeinitUndefined(self: *Linter, node: Ast.Node.Index, fn_proto: Ast.full.
         return;
     }
 
-    // Check if last statement is `self.* = undefined;`
+    // Destroying a heap-allocated receiver also ends its lifetime. Requiring an
+    // invalidating write afterward would introduce a use-after-free.
+    if (self.lastStatementIsSelfDestroy(body_node, param_name)) return;
+
     if (self.lastStatementIsSelfUndefined(body_node, param_name)) return;
 
     // None of the valid patterns found
@@ -1663,12 +1682,14 @@ fn hasDeferSelfUndefined(self: *Linter, body_node: Ast.Node.Index, param_name: [
     const stmts = self.tree.blockStatements(&buf, body_node) orelse return false;
 
     for (stmts) |stmt| {
-        if (self.tree.nodeTag(stmt) == .@"defer") {
-            const defer_expr = self.tree.nodeData(stmt).node;
-            if (self.isSelfUndefinedAssign(defer_expr, param_name)) return true;
-        }
+        if (self.isDeferSelfUndefined(stmt, param_name)) return true;
     }
     return false;
+}
+
+fn isDeferSelfUndefined(self: *Linter, node: Ast.Node.Index, param_name: []const u8) bool {
+    if (self.tree.nodeTag(node) != .@"defer") return false;
+    return self.isSelfUndefinedAssign(self.tree.nodeData(node).node, param_name);
 }
 
 fn hasUnsafeReturn(self: *Linter, node: Ast.Node.Index, param_name: []const u8, invalidated_before: bool) bool {
@@ -1689,7 +1710,9 @@ fn hasUnsafeReturn(self: *Linter, node: Ast.Node.Index, param_name: []const u8, 
             var invalidated = invalidated_before;
             for (block_stmts) |stmt| {
                 if (self.hasUnsafeReturn(stmt, param_name, invalidated)) return true;
-                if (self.isSelfUndefinedAssign(stmt, param_name)) invalidated = true;
+                if (self.isSelfUndefinedAssign(stmt, param_name) or self.isSelfDestroyCall(stmt, param_name)) {
+                    invalidated = true;
+                }
             }
         },
         else => {},
@@ -1704,6 +1727,102 @@ fn lastStatementIsSelfUndefined(self: *Linter, body_node: Ast.Node.Index, param_
 
     const last_stmt = stmts[stmts.len - 1];
     return self.isSelfUndefinedAssign(last_stmt, param_name);
+}
+
+fn lastStatementIsSelfDestroy(self: *Linter, body_node: Ast.Node.Index, param_name: []const u8) bool {
+    var buf: [2]Ast.Node.Index = undefined;
+    const stmts = self.tree.blockStatements(&buf, body_node) orelse return false;
+    if (stmts.len == 0) return false;
+
+    return self.isSelfDestroyCall(stmts[stmts.len - 1], param_name);
+}
+
+const ReceiverLifetime = struct {
+    can_fallthrough: bool = true,
+    destroyed_on_fallthrough: bool = false,
+    saw_destroy: bool = false,
+    invalidation_after_destroy: bool = false,
+    deferred_invalidation_after_destroy: bool = false,
+};
+
+fn analyzeReceiverLifetime(
+    self: *Linter,
+    node: Ast.Node.Index,
+    param_name: []const u8,
+    destroyed_before: bool,
+) ReceiverLifetime {
+    if (self.isSelfUndefinedAssign(node, param_name)) return .{
+        .destroyed_on_fallthrough = destroyed_before,
+        .invalidation_after_destroy = destroyed_before,
+    };
+    if (self.isSelfDestroyCall(node, param_name)) return .{
+        .destroyed_on_fallthrough = true,
+        .saw_destroy = true,
+    };
+    if (self.tree.nodeTag(node) == .@"return") return .{ .can_fallthrough = false };
+
+    switch (self.tree.nodeTag(node)) {
+        .@"if", .if_simple => {
+            const full_if = self.tree.fullIf(node) orelse return .{};
+            const then_result = self.analyzeReceiverLifetime(full_if.ast.then_expr, param_name, destroyed_before);
+            const else_result = if (full_if.ast.else_expr.unwrap()) |else_node|
+                self.analyzeReceiverLifetime(else_node, param_name, destroyed_before)
+            else
+                ReceiverLifetime{ .destroyed_on_fallthrough = destroyed_before };
+
+            return .{
+                .can_fallthrough = then_result.can_fallthrough or else_result.can_fallthrough,
+                .destroyed_on_fallthrough = (then_result.can_fallthrough and then_result.destroyed_on_fallthrough) or
+                    (else_result.can_fallthrough and else_result.destroyed_on_fallthrough),
+                .saw_destroy = then_result.saw_destroy or else_result.saw_destroy,
+                .invalidation_after_destroy = then_result.invalidation_after_destroy or
+                    else_result.invalidation_after_destroy,
+                .deferred_invalidation_after_destroy = then_result.deferred_invalidation_after_destroy or
+                    else_result.deferred_invalidation_after_destroy,
+            };
+        },
+        .block, .block_semicolon, .block_two, .block_two_semicolon => {
+            var block_buf: [2]Ast.Node.Index = undefined;
+            const block_stmts = self.tree.blockStatements(&block_buf, node) orelse return .{};
+            var result: ReceiverLifetime = .{ .destroyed_on_fallthrough = destroyed_before };
+            var has_deferred_invalidation = false;
+            for (block_stmts) |stmt| {
+                if (!result.can_fallthrough) break;
+                if (self.isDeferSelfUndefined(stmt, param_name)) {
+                    has_deferred_invalidation = true;
+                    result.deferred_invalidation_after_destroy = result.deferred_invalidation_after_destroy or
+                        result.destroyed_on_fallthrough;
+                    continue;
+                }
+                const stmt_result = self.analyzeReceiverLifetime(stmt, param_name, result.destroyed_on_fallthrough);
+                result.can_fallthrough = stmt_result.can_fallthrough;
+                result.destroyed_on_fallthrough = stmt_result.destroyed_on_fallthrough;
+                result.saw_destroy = result.saw_destroy or stmt_result.saw_destroy;
+                result.invalidation_after_destroy = result.invalidation_after_destroy or
+                    stmt_result.invalidation_after_destroy;
+                result.deferred_invalidation_after_destroy = result.deferred_invalidation_after_destroy or
+                    stmt_result.deferred_invalidation_after_destroy or
+                    (has_deferred_invalidation and stmt_result.saw_destroy);
+            }
+            return result;
+        },
+        else => return .{ .destroyed_on_fallthrough = destroyed_before },
+    }
+}
+
+fn isSelfDestroyCall(self: *Linter, node: Ast.Node.Index, param_name: []const u8) bool {
+    var buf: [1]Ast.Node.Index = undefined;
+    const call = self.tree.fullCall(&buf, node) orelse return false;
+    if (call.ast.params.len != 1) return false;
+
+    const fn_expr = call.ast.fn_expr;
+    if (self.tree.nodeTag(fn_expr) != .field_access) return false;
+    const field_access = self.tree.nodeData(fn_expr).node_and_token;
+    if (!std.mem.eql(u8, self.tree.tokenSlice(field_access[1]), "destroy")) return false;
+
+    const arg = call.ast.params[0];
+    if (self.tree.nodeTag(arg) != .identifier) return false;
+    return std.mem.eql(u8, self.tree.tokenSlice(self.tree.nodeMainToken(arg)), param_name);
 }
 
 fn isSelfUndefinedAssign(self: *Linter, node: Ast.Node.Index, param_name: []const u8) bool {
@@ -6054,6 +6173,125 @@ test "Z030: allow deinit with self.* = undefined at end" {
         \\    fn deinit(self: *Foo) void {
         \\        self.a = 0;
         \\        self.* = undefined;
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z030));
+}
+
+test "Z030: allow deinit that destroys self" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    fn deinit(self: *Foo, allocator: Allocator) void {
+        \\        allocator.destroy(self);
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z030));
+}
+
+test "Z030: allow invalidation before destroying self" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    fn deinit(self: *Foo, allocator: Allocator) void {
+        \\        self.* = undefined;
+        \\        allocator.destroy(self);
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z030));
+}
+
+test "Z030: reject invalidation after destroying self" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    fn deinit(self: *Foo, allocator: Allocator) void {
+        \\        allocator.destroy(self);
+        \\        self.* = undefined;
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z030));
+}
+
+test "Z030: reject deferred invalidation when destroying self" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    fn deinit(self: *Foo, allocator: Allocator) void {
+        \\        defer self.* = undefined;
+        \\        allocator.destroy(self);
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z030));
+}
+
+test "Z030: reject deferred invalidation when statements follow self destruction" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    fn deinit(self: *Foo, allocator: Allocator) void {
+        \\        defer self.* = undefined;
+        \\        allocator.destroy(self);
+        \\        cleanup();
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z030));
+}
+
+test "Z030: reject deferred invalidation with self destruction in nested branch" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    fn deinit(self: *Foo, allocator: Allocator, condition: bool) void {
+        \\        if (condition) {
+        \\            defer self.* = undefined;
+        \\            allocator.destroy(self);
+        \\            return;
+        \\        }
+        \\        allocator.destroy(self);
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z030));
+}
+
+test "Z030: reject invalidation after conditional self destruction" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    fn deinit(self: *Foo, allocator: Allocator, condition: bool) void {
+        \\        if (condition) allocator.destroy(self);
+        \\        self.* = undefined;
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z030));
+}
+
+test "Z030: allow return after branch destroys self" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    fn deinit(self: *Foo, allocator: Allocator, condition: bool) void {
+        \\        if (condition) {
+        \\            allocator.destroy(self);
+        \\            return;
+        \\        }
+        \\        allocator.destroy(self);
         \\    }
         \\};
     , "test.zig", null);
