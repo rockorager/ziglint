@@ -653,6 +653,25 @@ fn checkInlineImports(self: *Linter) void {
                     current = parent;
                     continue;
                 },
+                .call_one, .call_one_comma, .call, .call_comma => {
+                    // Continue walking up only when the chain is the callee being
+                    // called, e.g. `const log = @import("log.zig").scoped(.mod);`.
+                    // When the import chain is an argument (`foo(@import("x").y)`)
+                    // the callee is unrelated, so the import stays inline.
+                    var call_buf: [1]Ast.Node.Index = undefined;
+                    const call = self.tree.fullCall(&call_buf, parent) orelse {
+                        const loc = self.tree.tokenLocation(0, main_token);
+                        self.report(loc, .Z028, "");
+                        break;
+                    };
+                    if (call.ast.fn_expr != current) {
+                        const loc = self.tree.tokenLocation(0, main_token);
+                        self.report(loc, .Z028, "");
+                        break;
+                    }
+                    current = parent;
+                    continue;
+                },
                 .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => {
                     const var_decl = self.tree.fullVarDecl(parent) orelse {
                         const loc = self.tree.tokenLocation(0, main_token);
@@ -6150,6 +6169,41 @@ test "Z028: allow field access on import" {
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(0, linter.diagnosticCount(.Z028));
+}
+
+test "Z028: allow chained call on import" {
+    // `@import("log.zig").scoped(.mod)` — the std.log-style scoped logger
+    // idiom with a project-local module. The import still lands in a
+    // top-level const, so it is not inline.
+    var linter: Linter = .init(std.testing.allocator,
+        \\const log = @import("log.zig").scoped(.my_module);
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z028));
+}
+
+test "Z028: import as call argument is still inline" {
+    // The import chain is an *argument* of foo, not the callee —
+    // it must stay flagged even though a call sits in the parent chain.
+    var linter: Linter = .init(std.testing.allocator,
+        \\const z = foo(@import("bar.zig").baz);
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z028));
+}
+
+test "Z028: chained call on import inside function is still inline" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\pub fn main() void {
+        \\    const log = @import("log.zig").scoped(.my_module);
+        \\    _ = log;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z028));
 }
 
 test "Z030: detect missing self.* = undefined in deinit" {
