@@ -1087,7 +1087,8 @@ fn isPrivateTypeRef(self: *Linter, name: []const u8, enclosing_container: Ast.No
 /// an alias for the container itself, so references to it are container-self
 /// references, not private-type exposures.
 fn isThisAliasInContainer(self: *Linter, name: []const u8, container: Ast.Node.Index) bool {
-    const members = self.getContainerMembers(container) orelse return false;
+    var members_buf: [2]Ast.Node.Index = undefined;
+    const members = self.getContainerMembers(container, &members_buf) orelse return false;
     for (members) |member| {
         switch (self.tree.nodeTag(member)) {
             .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => {},
@@ -1118,7 +1119,8 @@ fn containerOwnName(self: *Linter, container: Ast.Node.Index) ?[]const u8 {
 /// Check if a type name is declared as `pub const` within the given container
 fn isPublicInContainer(self: *Linter, name: []const u8, container_opt: Ast.Node.OptionalIndex) bool {
     const container = container_opt.unwrap() orelse return false;
-    const members = self.getContainerMembers(container) orelse return false;
+    var members_buf: [2]Ast.Node.Index = undefined;
+    const members = self.getContainerMembers(container, &members_buf) orelse return false;
 
     for (members) |member| {
         const tag = self.tree.nodeTag(member);
@@ -1139,13 +1141,21 @@ fn isPublicInContainer(self: *Linter, name: []const u8, container_opt: Ast.Node.
     return false;
 }
 
-/// Get the member declarations of a container node
-fn getContainerMembers(self: *Linter, node: Ast.Node.Index) ?[]const Ast.Node.Index {
+/// Get the member declarations of a container node.
+///
+/// For containers with at most two members, fullContainerDecl stores the
+/// members in `buf`, so the returned slice points into it: the buffer must
+/// outlive every use of the result. Keeping it inside this function handed
+/// callers a dangling stack slice (CI crashed reading garbage node indices).
+fn getContainerMembers(
+    self: *Linter,
+    node: Ast.Node.Index,
+    buf: *[2]Ast.Node.Index,
+) ?[]const Ast.Node.Index {
     // fullContainerDecl covers every container shape (struct, enum, union,
     // tagged union, with/without args), so member lookups cannot miss a
     // variant the way a hand-rolled tag switch can.
-    var buf: [2]Ast.Node.Index = undefined;
-    const container = self.tree.fullContainerDecl(&buf, node) orelse return null;
+    const container = self.tree.fullContainerDecl(buf, node) orelse return null;
     return container.ast.members;
 }
 
@@ -4766,6 +4776,51 @@ test "Z012: Self alias of @This() in enclosing container is ok" {
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(0, linter.diagnosticCount(.Z012));
+}
+
+test "getContainerMembers: members outlive the call" {
+    // Regression: getContainerMembers kept the [2]Index buffer in its own
+    // frame and returned a slice into it — a dangling slice once the frame
+    // died. FullContainerDecl only backs <=2-member containers with the
+    // caller's buffer, so this read garbage node indices on stacks where
+    // the region was reused (CI crashed in nodeTag). Callers now own the
+    // buffer; this test clobbers the callee's dead region and then reads
+    // the members.
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    const Inner = struct {};
+        \\    pub fn a(i: Inner) void { _ = i; }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+
+    // Foo's container is the root var decl's init node.
+    const root_decl = linter.tree.rootDecls()[0];
+    const var_decl = linter.tree.fullVarDecl(root_decl) orelse
+        return error.TestUnexpectedResult;
+    const container = var_decl.ast.init_node.unwrap() orelse
+        return error.TestUnexpectedResult;
+
+    var buf: [2]Ast.Node.Index = undefined;
+    const members = linter.getContainerMembers(container, &buf) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), members.len);
+
+    // Reuse the stack the callee's dead frame occupied.
+    const junk: [4096]u8 = @splat(0xAA);
+    std.mem.doNotOptimizeAway(junk[0]);
+
+    for (members) |member| {
+        // Must stay a real node: garbage reads panic out of bounds here.
+        _ = linter.tree.nodeTag(member);
+    }
+    const first = linter.tree.fullVarDecl(members[0]) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(
+        "Inner",
+        linter.tree.tokenSlice(first.ast.mut_token + 1),
+    );
 }
 
 test "Z012: pub fn returning builtin type is ok" {
