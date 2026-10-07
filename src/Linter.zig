@@ -944,14 +944,18 @@ fn buildPublicTypesMap(self: *Linter) void {
 fn isImportedType(self: *Linter, var_decl: Ast.full.VarDecl) bool {
     const init_node = var_decl.ast.init_node.unwrap() orelse return false;
 
-    // Use type resolver if available
+    // Use type resolver if available. Unresolved is not a negative answer:
+    // the module graph resolves only std, builtin, and relative .zig
+    // imports, so build-declared module names (@import("runtime")) and
+    // unresolvable chains answer unknown — the syntactic check below must
+    // still run for those.
     if (self.type_resolver) |resolver| {
         if (self.module_path) |mod_path| {
             const type_info = resolver.typeOf(mod_path, init_node);
-            return switch (type_info) {
-                .type_type, .std_type, .user_type => true,
-                else => false,
-            };
+            switch (type_info) {
+                .type_type, .std_type, .user_type => return true,
+                else => {},
+            }
         }
     }
 
@@ -3408,6 +3412,100 @@ test "Z006: allow @Vector type alias" {
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z012: member-of-module type alias is imported, not private" {
+    // `const Action = @import("actions.zig").Action;` — a file-local alias
+    // to a type that is pub at its definition. 0.6.0 resolved the member
+    // access to unknown and treated that as an authoritative "not
+    // imported", flagging every pub fn using the alias (115 hits across
+    // one migration alone).
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "actions.zig",
+        .data =
+        \\pub const Action = struct { kind: u32 };
+        ,
+    });
+    try tmp_dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "reducers.zig",
+        .data =
+        \\const Action = @import("actions.zig").Action;
+        \\pub fn apply(action: Action) Action {
+        \\    return action;
+        \\}
+        ,
+    });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "reducers.zig", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
+    defer graph.deinit();
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    const source = try std.testing.allocator.dupeZ(u8, graph.getModule(path).?.source);
+    defer std.testing.allocator.free(source);
+
+    var linter: Linter = .initWithSemantics(
+        std.testing.allocator,
+        source,
+        path,
+        &resolver,
+        path,
+        null,
+    );
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z012));
+}
+
+test "Z012: bare module-name import falls back to syntax" {
+    // `@import("runtime")` — a build-declared module name. The module
+    // graph resolves only std, builtin, and relative .zig imports, so the
+    // resolver answers unknown; the syntactic import check must still run.
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "runtime.zig",
+        .data =
+        \\pub const address = struct {
+        \\    pub const Address = struct { host: []const u8 };
+        \\};
+        ,
+    });
+    try tmp_dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "listen_port.zig",
+        .data =
+        \\const Address = @import("runtime").address.Address;
+        \\pub fn reserve(address: *Address) void {
+        \\    _ = address;
+        \\}
+        ,
+    });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "listen_port.zig", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
+    defer graph.deinit();
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    const source = try std.testing.allocator.dupeZ(u8, graph.getModule(path).?.source);
+    defer std.testing.allocator.free(source);
+
+    var linter: Linter = .initWithSemantics(
+        std.testing.allocator,
+        source,
+        path,
+        &resolver,
+        path,
+        null,
+    );
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z012));
 }
 
 test "Z006: resolver sees camelCase type-fn call as type alias" {

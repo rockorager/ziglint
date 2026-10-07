@@ -807,7 +807,17 @@ fn resolveFieldAccess(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Inde
             const full_path = self.buildStdTypePath(tree, node);
             return .{ .std_type = .{ .path = full_path } };
         },
-        .user_type => {
+        .user_type => |u| {
+            // A ".zig" name marks a module import: resolve the member
+            // through the module's root decls (`mod.SomeType`), not through
+            // std path building. Nested namespaces that do not resolve to
+            // decls answer unknown, and callers fall back to syntax.
+            if (std.mem.endsWith(u8, u.name, ".zig")) {
+                if (self.graph.getModule(u.module_path)) |mod| {
+                    return self.resolveModuleRootDecl(&mod.tree, field_name, u.module_path);
+                }
+                return .unknown;
+            }
             // Accessing a field on a user type - could be a nested type
             const full_path = self.buildStdTypePath(tree, node);
             return .{ .std_type = .{ .path = full_path } };
@@ -1058,6 +1068,36 @@ fn resolveMethodCall(self: *TypeResolver, tree: *const Ast, fn_expr: Ast.Node.In
         else => {},
     }
 
+    return .unknown;
+}
+
+/// Resolve `name` declared at module root — a type alias (`pub const Foo =
+/// struct {...}`), a value decl, or a function — for `mod.name` member access
+/// where the receiver is a module import.
+fn resolveModuleRootDecl(self: *TypeResolver, tree: *const Ast, name: []const u8, module_path: []const u8) TypeInfo {
+    for (tree.rootDecls()) |decl_node| {
+        switch (tree.nodeTag(decl_node)) {
+            .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => {
+                const var_decl = tree.fullVarDecl(decl_node) orelse continue;
+                const name_token = var_decl.ast.mut_token + 1;
+                if (!std.mem.eql(u8, tree.tokenSlice(name_token), name)) continue;
+                const init_node = var_decl.ast.init_node.unwrap() orelse continue;
+                // A container decl names a type in this module.
+                if (isContainerDecl(tree.nodeTag(init_node))) {
+                    return .{ .user_type = .{ .module_path = module_path, .name = name } };
+                }
+                return self.resolveNodeType(tree, init_node, module_path);
+            },
+            .fn_decl => {
+                var buf: [1]Ast.Node.Index = undefined;
+                const fn_proto = tree.fullFnProto(&buf, decl_node) orelse continue;
+                const fn_name_token = fn_proto.name_token orelse continue;
+                if (!std.mem.eql(u8, tree.tokenSlice(fn_name_token), name)) continue;
+                return self.resolveFnDecl(tree, decl_node, module_path);
+            },
+            else => {},
+        }
+    }
     return .unknown;
 }
 
