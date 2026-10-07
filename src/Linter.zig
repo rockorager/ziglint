@@ -798,6 +798,12 @@ fn findEnclosingStructName(self: *Linter, start_node: Ast.Node.Index) ?[]const u
             .container_decl_two_trailing,
             .container_decl_arg,
             .container_decl_arg_trailing,
+            .tagged_union,
+            .tagged_union_trailing,
+            .tagged_union_two,
+            .tagged_union_two_trailing,
+            .tagged_union_enum_tag,
+            .tagged_union_enum_tag_trailing,
             => true,
             else => false,
         };
@@ -871,6 +877,12 @@ fn findEnclosingContainer(self: *Linter, start_node: Ast.Node.Index) Ast.Node.Op
             .container_decl_two_trailing,
             .container_decl_arg,
             .container_decl_arg_trailing,
+            .tagged_union,
+            .tagged_union_trailing,
+            .tagged_union_two,
+            .tagged_union_two_trailing,
+            .tagged_union_enum_tag,
+            .tagged_union_enum_tag_trailing,
             => true,
             else => false,
         };
@@ -1056,9 +1068,51 @@ fn isPrivateTypeRef(self: *Linter, name: []const u8, enclosing_container: Ast.No
     if (self.imported_types.contains(name)) return false;
     // Don't flag Self type (type matching filename for file-as-struct pattern)
     if (self.isSelfType(name)) return false;
-    // Check if type is pub within the enclosing container
-    if (self.isPublicInContainer(name, enclosing_container)) return false;
+    // A type pub in any enclosing container is nameable alongside this
+    // function, and so is an enclosing container itself: self-referencing
+    // methods like `fn send(self: *Connection)` are not private exposures.
+    var container_opt = enclosing_container;
+    while (container_opt.unwrap()) |container| {
+        if (self.containerOwnName(container)) |own| {
+            if (std.mem.eql(u8, own, name)) return false;
+        }
+        if (self.isThisAliasInContainer(name, container)) return false;
+        if (self.isPublicInContainer(name, container.toOptional())) return false;
+        container_opt = self.findEnclosingContainer(container);
+    }
     return true;
+}
+
+/// True when `name` is declared in `container` as `const name = @This()` —
+/// an alias for the container itself, so references to it are container-self
+/// references, not private-type exposures.
+fn isThisAliasInContainer(self: *Linter, name: []const u8, container: Ast.Node.Index) bool {
+    const members = self.getContainerMembers(container) orelse return false;
+    for (members) |member| {
+        switch (self.tree.nodeTag(member)) {
+            .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => {},
+            else => continue,
+        }
+        const var_decl = self.tree.fullVarDecl(member) orelse continue;
+        const name_token = var_decl.ast.mut_token + 1;
+        if (!std.mem.eql(u8, self.tree.tokenSlice(name_token), name)) continue;
+        const init_node = var_decl.ast.init_node.unwrap() orelse continue;
+        switch (self.tree.nodeTag(init_node)) {
+            .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => {},
+            else => continue,
+        }
+        if (std.mem.eql(u8, self.tree.tokenSlice(self.tree.nodeMainToken(init_node)), "@This")) return true;
+    }
+    return false;
+}
+
+/// Name of the decl a container belongs to (`const Foo = struct {...}` → Foo),
+/// or null for anonymous containers.
+fn containerOwnName(self: *Linter, container: Ast.Node.Index) ?[]const u8 {
+    const parent = self.parent_map[@intFromEnum(container)].unwrap() orelse return null;
+    const var_decl = self.tree.fullVarDecl(parent) orelse return null;
+    const name_token = var_decl.ast.mut_token + 1;
+    return self.tree.tokenSlice(name_token);
 }
 
 /// Check if a type name is declared as `pub const` within the given container
@@ -1087,16 +1141,12 @@ fn isPublicInContainer(self: *Linter, name: []const u8, container_opt: Ast.Node.
 
 /// Get the member declarations of a container node
 fn getContainerMembers(self: *Linter, node: Ast.Node.Index) ?[]const Ast.Node.Index {
-    const tag = self.tree.nodeTag(node);
-    return switch (tag) {
-        .container_decl, .container_decl_trailing => self.tree.containerDecl(node).ast.members,
-        .container_decl_two, .container_decl_two_trailing => blk: {
-            var buf: [2]Ast.Node.Index = undefined;
-            break :blk self.tree.containerDeclTwo(&buf, node).ast.members;
-        },
-        .container_decl_arg, .container_decl_arg_trailing => self.tree.containerDeclArg(node).ast.members,
-        else => null,
-    };
+    // fullContainerDecl covers every container shape (struct, enum, union,
+    // tagged union, with/without args), so member lookups cannot miss a
+    // variant the way a hand-rolled tag switch can.
+    var buf: [2]Ast.Node.Index = undefined;
+    const container = self.tree.fullContainerDecl(&buf, node) orelse return null;
+    return container.ast.members;
 }
 
 fn isSelfType(self: *Linter, name: []const u8) bool {
@@ -1446,6 +1496,18 @@ fn checkTypeNodeForPrivateImpl(
             const data = self.tree.nodeData(type_node).node_and_node;
             self.checkTypeNodeForPrivateImpl(data[0], fn_proto, generic_params, true, enclosing_container);
             self.checkTypeNodeForPrivateImpl(data[1], fn_proto, generic_params, false, enclosing_container);
+        },
+        // Pointer types (e.g., *Hidden, []Hidden, [*]const Hidden)
+        .ptr_type_aligned, .ptr_type_sentinel, .ptr_type, .ptr_type_bit_range => {
+            if (self.tree.fullPtrType(type_node)) |ptr| {
+                self.checkTypeNodeForPrivateImpl(ptr.ast.child_type, fn_proto, generic_params, is_error_position, enclosing_container);
+            }
+        },
+        // Array types (e.g., [4]Hidden)
+        .array_type, .array_type_sentinel => {
+            if (self.tree.fullArrayType(type_node)) |arr| {
+                self.checkTypeNodeForPrivateImpl(arr.ast.elem_type, fn_proto, generic_params, is_error_position, enclosing_container);
+            }
         },
         else => {},
     }
@@ -4532,6 +4594,115 @@ test "Z012: pub fn using non-pub type from enclosing struct is error" {
     linter.lint();
     try std.testing.expectEqual(1, linter.diagnostics.items.len);
     try std.testing.expectEqual(rules.Rule.Z012, linter.diagnostics.items[0].rule);
+}
+
+test "Z012: pub fn in nested container using outer pub types is ok" {
+    // Methods of Connection.Io reference types pub in the *outer* container
+    // (Connection, and Io itself); only the immediate container was searched.
+    var linter: Linter = .init(std.testing.allocator,
+        \\pub const Connection = struct {
+        \\    pub const Config = struct { retries: u32 };
+        \\    pub const Io = struct {
+        \\        pub fn get(self: Io, cfg: Config) Config {
+        \\            _ = self;
+        \\            return cfg;
+        \\        }
+        \\    };
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z012));
+}
+
+test "Z012: pub fn in nested container using outer non-pub type is error" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\pub const Connection = struct {
+        \\    const Hidden = struct {};
+        \\    pub const Io = struct {
+        \\        pub fn get(h: Hidden) Hidden {
+        \\            return h;
+        \\        }
+        \\    };
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(2, linter.diagnosticCount(.Z012));
+}
+
+test "Z012: pub fn exposing private type through pointer is error" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Hidden = struct {};
+        \\pub fn take(h: *Hidden) void { _ = h; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z012));
+}
+
+test "Z012: pub fn exposing private type through slice and array is error" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Hidden = struct {};
+        \\pub fn take(h: []Hidden) void { _ = h; }
+        \\pub fn takeArr(h: [4]Hidden) void { _ = h; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(2, linter.diagnosticCount(.Z012));
+}
+
+test "Z012: self receiver pointer in non-pub container is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    pub fn bar(self: *Foo) void { _ = self; }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z012));
+}
+
+test "Z012: non-pub container self reference by value is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Foo = struct {
+        \\    pub fn bar(s: Foo) Foo { return s; }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z012));
+}
+
+test "Z012: pub fn in tagged union using sibling pub type is ok" {
+    // getContainerMembers only handled struct-shaped containers, so types
+    // pub inside a union(enum) were invisible to the ancestor search.
+    var linter: Linter = .init(std.testing.allocator,
+        \\pub const State = union(enum) {
+        \\    idle,
+        \\    pub const Close = struct { backend: bool = false };
+        \\    pub fn extract(self: *const State) Close {
+        \\        _ = self;
+        \\        return .{};
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z012));
+}
+
+test "Z012: Self alias of @This() in enclosing container is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Addr = struct {
+        \\    const Self = @This();
+        \\    port: u16,
+        \\    pub fn format(self: Self) void { _ = self; }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z012));
 }
 
 test "Z012: pub fn returning builtin type is ok" {
