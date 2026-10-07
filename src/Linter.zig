@@ -2972,6 +2972,20 @@ fn isPrimitiveType(name: []const u8) bool {
 
 fn isTypeAlias(self: *Linter, var_decl: Ast.full.VarDecl) bool {
     const init_node = var_decl.ast.init_node.unwrap() orelse return false;
+
+    // With a module graph, ask the resolver instead of guessing from callee
+    // name shape: a camelCase type-fn (std.log-style `withContext`) still
+    // yields a type. Only a positive answer counts; `unknown` falls through
+    // to the syntactic checks below.
+    if (self.type_resolver) |resolver| {
+        if (self.module_path) |mod_path| {
+            switch (resolver.typeOf(mod_path, init_node)) {
+                .type_type => return true,
+                else => {},
+            }
+        }
+    }
+
     const tag = self.tree.nodeTag(init_node);
     return switch (tag) {
         .identifier => blk: {
@@ -3373,6 +3387,55 @@ test "Z006: allow @Vector type alias" {
         \\const chunk_bytes = 32;
         \\const Chunk = @Vector(chunk_bytes, u8);
     , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: resolver sees camelCase type-fn call as type alias" {
+    // `withContext` returns `type` but keeps a std.log-style camelCase name,
+    // so the syntactic PascalCase-callee check cannot recognize the alias.
+    // With a module graph the resolver must answer "is this a type?".
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "log.zig",
+        .data =
+        \\pub const Logger = struct { pub fn info() void {} };
+        \\pub fn withContext(comptime Ctx: type, comptime scope: anytype) type {
+        \\    _ = Ctx;
+        \\    _ = scope;
+        \\    return Logger;
+        \\}
+        ,
+    });
+    try tmp_dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.zig",
+        .data =
+        \\const logging = @import("log.zig");
+        \\const Ctx = struct { a: u32 };
+        \\const ConnLog = logging.withContext(Ctx, .conn);
+        ,
+    });
+    const main_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "main.zig", std.testing.allocator);
+    defer std.testing.allocator.free(main_path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, main_path, null);
+    defer graph.deinit();
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    const source = try std.testing.allocator.dupeZ(u8, graph.getModule(main_path).?.source);
+    defer std.testing.allocator.free(source);
+
+    var linter: Linter = .initWithSemantics(
+        std.testing.allocator,
+        source,
+        main_path,
+        &resolver,
+        main_path,
+        null,
+    );
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));

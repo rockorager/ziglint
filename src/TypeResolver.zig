@@ -969,10 +969,18 @@ fn resolveBuiltinCall(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Inde
         }
 
         if (std.mem.endsWith(u8, import_str, ".zig")) {
-            return .{ .user_type = .{
-                .module_path = module_path,
-                .name = import_str,
-            } };
+            // Resolve the import against the importing module's directory and
+            // borrow the graph's canonical path, so module_path names the
+            // imported module — not, as before, the importing one.
+            const module_dir = std.fs.path.dirname(module_path) orelse ".";
+            const joined = std.fs.path.join(self.allocator, &.{ module_dir, import_str }) catch return .unknown;
+            defer self.allocator.free(joined);
+            if (self.graph.getModule(joined)) |mod| {
+                // A name ending in ".zig" marks a module import; container decl
+                // names can never contain a dot.
+                return .{ .user_type = .{ .module_path = mod.path, .name = import_str } };
+            }
+            return .unknown;
         }
     }
 
@@ -1037,8 +1045,12 @@ fn resolveMethodCall(self: *TypeResolver, tree: *const Ast, fn_expr: Ast.Node.In
         .user_type => |u| {
             const mod = self.graph.getModule(u.module_path) orelse return .unknown;
             const mod_tree = &mod.tree;
-            const fn_node = self.findFnInType(mod_tree, u.name, method_name) orelse
-                return .unknown;
+            // A ".zig" name marks a module import: the fn lives at module root
+            // (`mod.someFn(...)`), not inside a named container.
+            const fn_node = if (std.mem.endsWith(u8, u.name, ".zig"))
+                findFnAtModuleRoot(mod_tree, method_name) orelse return .unknown
+            else
+                self.findFnInType(mod_tree, u.name, method_name) orelse return .unknown;
             var buf: [1]Ast.Node.Index = undefined;
             const fn_proto = mod_tree.fullFnProto(&buf, fn_node) orelse return .unknown;
             return self.resolveReturnType(mod_tree, fn_proto, u.module_path);
@@ -1047,6 +1059,17 @@ fn resolveMethodCall(self: *TypeResolver, tree: *const Ast, fn_expr: Ast.Node.In
     }
 
     return .unknown;
+}
+
+fn findFnAtModuleRoot(tree: *const Ast, fn_name: []const u8) ?Ast.Node.Index {
+    for (tree.rootDecls()) |decl_node| {
+        if (tree.nodeTag(decl_node) != .fn_decl) continue;
+        var buf: [1]Ast.Node.Index = undefined;
+        const fn_proto = tree.fullFnProto(&buf, decl_node) orelse continue;
+        const name_token = fn_proto.name_token orelse continue;
+        if (std.mem.eql(u8, tree.tokenSlice(name_token), fn_name)) return decl_node;
+    }
+    return null;
 }
 
 fn findFnInType(self: *TypeResolver, tree: *const Ast, type_name: []const u8, fn_name: []const u8) ?Ast.Node.Index {
