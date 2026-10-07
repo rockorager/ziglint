@@ -32,10 +32,6 @@
             zls_0_16
             zigdoc
           ];
-
-          shellHook = ''
-            unset ZIG_GLOBAL_CACHE_DIR
-          '';
         };
       }
     );
