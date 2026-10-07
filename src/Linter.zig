@@ -258,8 +258,7 @@ fn collectAllIdentifiers(self: *Linter) void {
         switch (tag) {
             .identifier => {
                 const name = self.tree.tokenSlice(self.tree.nodeMainToken(node));
-                // ziglint-ignore: Z026
-                self.used_identifiers.put(self.allocator, name, {}) catch {};
+                self.track(&self.used_identifiers, name);
             },
             .field_access => {
                 // Walk field_access chain, tracking all field names and root identifier
@@ -267,14 +266,12 @@ fn collectAllIdentifiers(self: *Linter) void {
                 while (self.tree.nodeTag(current) == .field_access) {
                     const data = self.tree.nodeData(current).node_and_token;
                     const field_name = self.tree.tokenSlice(data[1]);
-                    // ziglint-ignore: Z026
-                    self.used_identifiers.put(self.allocator, field_name, {}) catch {};
+                    self.track(&self.used_identifiers, field_name);
                     current = data[0];
                 }
                 if (self.tree.nodeTag(current) == .identifier) {
                     const name = self.tree.tokenSlice(self.tree.nodeMainToken(current));
-                    // ziglint-ignore: Z026
-                    self.used_identifiers.put(self.allocator, name, {}) catch {};
+                    self.track(&self.used_identifiers, name);
                 }
             },
             else => {},
@@ -609,8 +606,7 @@ fn checkThisBuiltin(self: *Linter) void {
                     @memcpy(context[0..alias_name.len], alias_name);
                     context[alias_name.len] = 0;
                     @memcpy(context[alias_name.len + 1 ..], expected);
-                    // ziglint-ignore: Z026
-                    self.allocated_contexts.append(self.allocator, context) catch {};
+                    self.trackContext(context);
                     self.report(loc, .Z021, context);
                 }
             }
@@ -931,16 +927,14 @@ fn buildPublicTypesMap(self: *Linter) void {
 
                 // Track imported types (field access ending in PascalCase, e.g., std.mem.Allocator)
                 if (self.isImportedType(var_decl)) {
-                    // ziglint-ignore: Z026
-                    self.imported_types.put(self.allocator, name, {}) catch {};
+                    self.track(&self.imported_types, name);
                     continue;
                 }
 
                 if (!self.isPublicDecl(node)) continue;
                 if (!self.isTypeDecl(var_decl)) continue;
 
-                // ziglint-ignore: Z026
-                self.public_types.put(self.allocator, name, {}) catch {};
+                self.track(&self.public_types, name);
             },
             else => {},
         }
@@ -1259,8 +1253,7 @@ fn checkArgumentOrder(self: *Linter, node: Ast.Node.Index) void {
                 kind.name(),
                 max_kind.name(),
             }) catch continue;
-            // ziglint-ignore: Z026
-            self.allocated_contexts.append(self.allocator, context) catch {};
+            self.trackContext(context);
             self.report(loc, .Z023, context);
         }
 
@@ -1424,8 +1417,7 @@ fn getFieldAccessPath(self: *Linter, node: Ast.Node.Index) ?[]const u8 {
         pos += p.len;
     }
 
-    // ziglint-ignore: Z026
-    self.allocated_contexts.append(self.allocator, result) catch {};
+    self.trackContext(result);
     return result;
 }
 
@@ -1705,10 +1697,8 @@ fn checkFnDecl(self: *Linter, node: Ast.Node.Index) void {
             @memcpy(context[0..name.len], name);
             context[name.len] = 0;
             @memcpy(context[name.len + 1 ..], suggestion);
-            // ziglint-ignore: Z026
-            self.allocated_contexts.append(self.allocator, context) catch {};
-            // ziglint-ignore: Z026
-            self.allocated_contexts.append(self.allocator, suggestion) catch {};
+            self.trackContext(context);
+            self.trackContext(suggestion);
             const loc = self.tree.tokenLocation(0, name_token);
             self.report(loc, .Z032, context);
         }
@@ -2024,10 +2014,8 @@ fn checkVarDecl(self: *Linter, node: Ast.Node.Index) void {
             @memcpy(context[0..name.len], name);
             context[name.len] = 0;
             @memcpy(context[name.len + 1 ..], suggestion);
-            // ziglint-ignore: Z026
-            self.allocated_contexts.append(self.allocator, context) catch {};
-            // ziglint-ignore: Z026
-            self.allocated_contexts.append(self.allocator, suggestion) catch {};
+            self.trackContext(context);
+            self.trackContext(suggestion);
             const loc = self.tree.tokenLocation(0, name_token);
             self.report(loc, .Z032, context);
         }
@@ -2040,8 +2028,7 @@ fn checkVarDecl(self: *Linter, node: Ast.Node.Index) void {
             @memcpy(context[0..name.len], name);
             context[name.len] = 0;
             @memcpy(context[name.len + 1 ..], word);
-            // ziglint-ignore: Z026
-            self.allocated_contexts.append(self.allocator, context) catch {};
+            self.trackContext(context);
             const loc = self.tree.tokenLocation(0, name_token);
             self.report(loc, .Z033, context);
         }
@@ -2086,7 +2073,7 @@ fn trackImportBinding(self: *Linter, node: Ast.Node.Index, var_decl: Ast.full.Va
         .name_token = name_token,
         .is_pub = is_pub,
         .is_discard = is_discard,
-        // ziglint-ignore: Z026
+        // ziglint-ignore: Z026 -- import tracking must survive OOM mid-lint
     }) catch {};
 }
 
@@ -2111,7 +2098,7 @@ fn checkDupeImport(self: *Linter, var_decl: Ast.full.VarDecl, name_token: Ast.To
         const loc = self.tree.tokenLocation(0, name_token);
         self.report(loc, .Z007, import_path);
     } else {
-        // ziglint-ignore: Z026
+        // ziglint-ignore: Z026 -- import tracking must survive OOM mid-lint
         self.seen_imports.put(self.allocator, import_path, name_token) catch {};
     }
 }
@@ -2220,8 +2207,7 @@ fn checkInstanceDeclAccess(self: *Linter) void {
         const context = std.fmt.allocPrint(self.allocator, "{s}\x00{s}", .{
             field_name, type_name,
         }) catch continue;
-        // ziglint-ignore: Z026
-        self.allocated_contexts.append(self.allocator, context) catch {};
+        self.trackContext(context);
         self.report(loc, .Z027, context);
     }
 }
@@ -3218,7 +3204,7 @@ fn reportLineLength(self: *Linter, line: usize, context: []const u8, max_len: u3
         .column = @intCast(max_len + 1),
         .rule = .Z024,
         .context = context,
-        // ziglint-ignore: Z026
+        // ziglint-ignore: Z026 -- on OOM the diagnostic is dropped, not the pass
     }) catch {};
 }
 
@@ -3230,6 +3216,20 @@ pub fn diagnosticCount(self: *const Linter, rule: rules.Rule) usize {
     return count;
 }
 
+/// Void-map bookkeeping (seen identifiers, public/imported types). The lint
+/// pass must survive OOM, so put failures are swallowed here, once.
+fn track(self: *Linter, map: *std.StringHashMapUnmanaged(void), key: []const u8) void {
+    // ziglint-ignore: Z026 -- bookkeeping must survive OOM mid-lint
+    map.put(self.allocator, key, {}) catch {};
+}
+
+/// Diagnostic-context strings are freed at deinit; registering one must
+/// survive OOM the same way.
+fn trackContext(self: *Linter, context: []const u8) void {
+    // ziglint-ignore: Z026 -- bookkeeping must survive OOM mid-lint
+    self.allocated_contexts.append(self.allocator, context) catch {};
+}
+
 fn report(self: *Linter, loc: Ast.Location, rule: rules.Rule, context: []const u8) void {
     if (self.isIgnored(loc.line, rule)) return;
 
@@ -3239,7 +3239,7 @@ fn report(self: *Linter, loc: Ast.Location, rule: rules.Rule, context: []const u
         .column = @intCast(loc.column + 1),
         .rule = rule,
         .context = context,
-        // ziglint-ignore: Z026
+        // ziglint-ignore: Z026 -- on OOM the diagnostic is dropped, not the pass
     }) catch {};
 }
 

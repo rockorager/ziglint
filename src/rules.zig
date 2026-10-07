@@ -40,10 +40,10 @@ pub const Rule = enum(u16) {
     /// All config types have `enabled: bool` (default varies per rule).
     /// Some rules have additional fields (e.g., Z024 has max_length).
     fn ConfigType(comptime self: Rule) type {
-        const DefaultConfig = RuleConfig(true, struct {});
-        const DisabledConfig = RuleConfig(false, struct {});
+        const DefaultConfig = RuleConfig(struct {}, true);
+        const DisabledConfig = RuleConfig(struct {}, false);
         return switch (self) {
-            .Z024 => RuleConfig(true, struct { max_length: u32 = 120 }),
+            .Z024 => RuleConfig(struct { max_length: u32 = 120 }, true),
             .Z033 => DisabledConfig, // Redundant type name words - disabled by default
             else => DefaultConfig,
         };
@@ -314,8 +314,7 @@ fn writeHighlightedStructInit(writer: *std.Io.Writer, code: []const u8, type_col
 }
 
 /// Generates a config struct with `enabled: bool` plus any extra fields.
-// ziglint-ignore: Z023
-fn RuleConfig(comptime enabled_by_default: bool, comptime Extra: type) type {
+fn RuleConfig(comptime Extra: type, comptime enabled_by_default: bool) type {
     const extra_fields = @typeInfo(Extra).@"struct".fields;
 
     var field_names: [1 + extra_fields.len][:0]const u8 = undefined;

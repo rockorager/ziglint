@@ -51,7 +51,7 @@ pub fn deinit(self: *ModuleGraph) void {
 }
 
 pub fn addModulePublic(self: *ModuleGraph, path: []const u8) void {
-    // ziglint-ignore: Z026
+    // ziglint-ignore: Z026 -- best-effort: linting continues without the module
     self.addModule(path) catch {};
 }
 

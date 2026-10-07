@@ -27,7 +27,7 @@ If the rule needs configuration beyond just `enabled`, add a case in `ConfigType
 ```zig
 fn ConfigType(comptime self: Rule) type {
     return switch (self) {
-        .ZXXX => RuleConfig(true, struct { my_param: u32 = 100 }),
+        .ZXXX => RuleConfig(struct { my_param: u32 = 100 }, true),
         // ...
     };
 }
