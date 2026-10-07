@@ -1007,6 +1007,14 @@ fn isTypeExpression(self: *Linter, node: Ast.Node.Index) bool {
         .error_union => true,
         // Error set declarations (e.g., error{A, B})
         .error_set_decl => true,
+        // Error set merges (e.g., `frame.EncodeError || error{ Unexpected }`).
+        // The parser emits merge_error_sets for every `||` between expressions,
+        // including runtime booleans, so both operands must themselves be type
+        // expressions to keep values out of public_types.
+        .merge_error_sets => blk: {
+            const data = self.tree.nodeData(node).node_and_node;
+            break :blk self.isTypeExpression(data[0]) and self.isTypeExpression(data[1]);
+        },
         // Function types
         .fn_proto,
         .fn_proto_multi,
@@ -4358,6 +4366,45 @@ test "Z015: pub fn returning private error set" {
     linter.lint();
     try std.testing.expectEqual(1, linter.diagnostics.items.len);
     try std.testing.expectEqual(rules.Rule.Z015, linter.diagnostics.items[0].rule);
+}
+
+test "Z015: pub error set merged with || is public" {
+    // Composed error sets (`A || B || error{...}`) are pub const type decls;
+    // they were never added to public_types, so every use read as private.
+    var linter: Linter = .init(std.testing.allocator,
+        \\const frame = @import("frame.zig");
+        \\pub const ParseError = frame.EncodeError || error{ Unexpected };
+        \\pub fn parse() ParseError!void {}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z015));
+}
+
+test "Z015: pub error set merged from named aliases is public" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\pub const AcceptError = error{ Bad };
+        \\pub const FlightError = error{ Worse };
+        \\pub const HandleError = AcceptError || FlightError;
+        \\pub fn handle() HandleError!void {}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z015));
+}
+
+test "Z015: runtime boolean || is not a type decl" {
+    // A non-pub `||` expression of runtime values must not sneak into
+    // public_types; the exposed set below is still private.
+    var linter: Linter = .init(std.testing.allocator,
+        \\const ready = true;
+        \\const done = ready || false;
+        \\const Set = error{Bad};
+        \\pub fn f() Set!void {}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z015));
 }
 
 test "Z012: pub fn returning public type is ok" {
