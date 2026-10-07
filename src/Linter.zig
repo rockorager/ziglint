@@ -1024,7 +1024,7 @@ fn isTypeExpression(self: *Linter, node: Ast.Node.Index) bool {
         // Builtin type constructors
         .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => blk: {
             const token = self.tree.tokenSlice(self.tree.nodeMainToken(node));
-            break :blk std.mem.eql(u8, token, "@Type");
+            break :blk isTypeReturningBuiltin(token);
         },
         // Identifier referencing another type (type alias)
         .identifier => blk: {
@@ -1106,6 +1106,16 @@ fn isSelfType(self: *Linter, name: []const u8) bool {
     else
         basename;
     return std.mem.eql(u8, name, stem);
+}
+
+/// Builtin calls that always produce a type. Both isTypeExpression (public_types)
+/// and isTypeAlias (Z006) must accept these, so keep the list in one place.
+fn isTypeReturningBuiltin(name: []const u8) bool {
+    const builtins = [_][]const u8{ "@This", "@Type", "@TypeOf", "@Vector", "@Frame", "@Struct", "@Fn" };
+    for (builtins) |b| {
+        if (std.mem.eql(u8, name, b)) return true;
+    }
+    return false;
 }
 
 fn isBuiltinType(name: []const u8) bool {
@@ -2913,10 +2923,7 @@ fn isTypeAlias(self: *Linter, var_decl: Ast.full.VarDecl) bool {
         },
         .builtin_call_two, .builtin_call_two_comma, .builtin_call, .builtin_call_comma => blk: {
             const token = self.tree.tokenSlice(self.tree.nodeMainToken(init_node));
-            break :blk std.mem.eql(u8, token, "@This") or
-                std.mem.eql(u8, token, "@import") or
-                std.mem.eql(u8, token, "@Type") or
-                std.mem.eql(u8, token, "@TypeOf");
+            break :blk std.mem.eql(u8, token, "@import") or isTypeReturningBuiltin(token);
         },
         .call_one, .call_one_comma => blk: {
             // Check if calling a PascalCase function (type constructor)
@@ -3297,6 +3304,86 @@ test "Z006: detect camelCase variable" {
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(1, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow @Vector type alias" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const chunk_bytes = 32;
+        \\const Chunk = @Vector(chunk_bytes, u8);
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow @Frame type alias" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn runner() void {}
+        \\const Runner = @Frame(runner);
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow @Struct type alias" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Fields = @Struct(.auto, null, &.{}, &.{}, &.{});
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z006: allow @Fn type alias" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn cb(x: u32) void { _ = x; }
+        \\const Callback = @Fn(.auto, .{}, cb, .{});
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z006));
+}
+
+test "Z012: pub fn returning @Struct alias is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\pub const Fields = @Struct(.auto, null, &.{}, &.{}, &.{});
+        \\pub fn get() Fields {}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z012));
+}
+
+test "Z012: pub fn returning @Vector alias is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\pub const Chunk = @Vector(4, u8);
+        \\pub fn get() Chunk {}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z012));
+}
+
+test "Z012: pub fn returning Self = @This() is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\pub const Self = @This();
+        \\pub fn get() Self {}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z012));
+}
+
+test "Z012: pub fn returning @TypeOf alias is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn probe() u32 { return 1; }
+        \\pub const Ret = @TypeOf(probe());
+        \\pub fn get() Ret {}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z012));
 }
 
 test "Z006: detect PascalCase variable (not type)" {
