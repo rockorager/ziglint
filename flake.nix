@@ -3,7 +3,7 @@
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
-    flake-utils.url = "github:numtide/flake-utils";
+    flake-parts.url = "github:hercules-ci/flake-parts";
     mattware = {
       url = "github:mattrobenolt/nixpkgs";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -11,28 +11,39 @@
   };
 
   outputs =
-    {
+    inputs@{
+      self,
+      flake-parts,
       nixpkgs,
-      flake-utils,
       mattware,
       ...
     }:
-    flake-utils.lib.eachDefaultSystem (
-      system:
-      let
-        pkgs = import nixpkgs {
-          inherit system;
-          overlays = [ mattware.overlays.default ];
+    flake-parts.lib.mkFlake { inherit inputs; } {
+      systems = [
+        "x86_64-linux"
+        "x64_64-darwin"
+        "aarch64-linux"
+        "aarch64-darwin"
+      ];
+
+      perSystem =
+        { system, ... }:
+        let
+          pkgs = import nixpkgs {
+            inherit system;
+            overlays = [ mattware.overlays.default ];
+          };
+        in
+        {
+          formatter = pkgs.nixfmt-tree;
+
+          devShells.default = pkgs.mkShell {
+            packages = with pkgs; [
+              zig_0_16
+              zls_0_16
+              zigdoc
+            ];
+          };
         };
-      in
-      {
-        devShells.default = pkgs.mkShell {
-          packages = with pkgs; [
-            zig_0_16
-            zls_0_16
-            zigdoc
-          ];
-        };
-      }
-    );
+    };
 }
