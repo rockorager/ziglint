@@ -44,7 +44,7 @@ Directories are scanned recursively for `.zig` files.
 | Z020 | Inline `@This()`; use the named type or a `Self` alias |
 | Z021 | File-struct `@This()` alias should match filename or be `Self` |
 | Z022 | `@This()` alias in anonymous/local struct should be `Self` |
-| Z023 | Parameter order: receiver, comptime, `Allocator`, `Io`, then runtime |
+| Z023 | Parameter order: `comptime T: type`, comptime values, `Allocator`, `Io`; runtime values position-free |
 | Z024 | Line exceeds maximum byte length (default: 120) |
 | Z025 | Redundant `catch |err| return err`; use `try` instead |
 | Z026 | Empty `catch` block suppresses errors |

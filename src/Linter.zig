@@ -1239,6 +1239,14 @@ fn checkArgumentOrder(self: *Linter, node: Ast.Node.Index) void {
 
         const kind = self.classifyParam(param);
 
+        // Runtime value params take any position: std's own corpus
+        // interleaves them freely (std.fmt.format(writer, comptime fmt,
+        // args), std.fmt.allocPrint(gpa, comptime fmt, args)). The rule
+        // orders the structural kinds among themselves — a total order
+        // including "other" flagged every writer-first and
+        // ctx-then-callback API.
+        if (kind == .other) continue;
+
         const current_order = kind.order();
 
         if (current_order < max_order) {
@@ -5437,8 +5445,8 @@ test "Z023: argument order - aliased Allocator" {
     const source =
         \\const std = @import("std");
         \\const Alloc = std.mem.Allocator;
-        \\fn bad(value: u32, alloc: Alloc) void {
-        \\    _ = .{ value, alloc };
+        \\fn bad(alloc: Alloc, comptime size: usize) void {
+        \\    _ = .{ alloc, size };
         \\}
     ;
 
@@ -5470,8 +5478,8 @@ test "Z023: argument order - aliased Io" {
     const source =
         \\const std = @import("std");
         \\const MyIo = std.Io;
-        \\fn bad(value: u32, io: MyIo) void {
-        \\    _ = .{ value, io };
+        \\fn bad(io: MyIo, gpa: std.mem.Allocator) void {
+        \\    _ = .{ io, gpa };
         \\}
     ;
 
@@ -5596,10 +5604,12 @@ test "Z023: file-as-struct receiver is ok (semantic)" {
 }
 
 test "Z023: non-receiver first param still checked" {
+    // A non-receiver first param does not disable checking of the rest;
+    // the runtime value is position-free, the structural inversion is not.
     var linter: Linter = .init(std.testing.allocator,
         \\const std = @import("std");
-        \\fn bad(value: u32, alloc: std.mem.Allocator) void {
-        \\    _ = .{ value, alloc };
+        \\fn bad(value: u32, io: std.Io, gpa: std.mem.Allocator) void {
+        \\    _ = .{ value, io, gpa };
         \\}
     , "test.zig", null);
     defer linter.deinit();
@@ -5653,19 +5663,42 @@ test "Z023: comptime value before allocator is ok" {
     }
 }
 
-test "Z023: comptime value after other is bad" {
+test "Z023: runtime value before comptime param is ok" {
+    // std.fmt.format(writer, comptime fmt, args): runtime value params take
+    // any position; the rule orders structural params, not prose.
     var linter: Linter = .init(std.testing.allocator,
-        \\fn bad(value: u32, comptime size: usize) void {
-        \\    _ = .{ value, size };
+        \\fn writeMetric(writer: u32, comptime name: []const u8) void {
+        \\    _ = .{ writer, name };
         \\}
     , "test.zig", null);
     defer linter.deinit();
     linter.lint();
-    var found = false;
-    for (linter.diagnostics.items) |d| {
-        if (d.rule == rules.Rule.Z023) found = true;
-    }
-    try std.testing.expect(found);
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z023));
+}
+
+test "Z023: ctx before comptime callback is ok" {
+    // Registration APIs read best as (ctx, comptime cb); the rule must not
+    // force the callback before the context it closes over.
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn watch(ctx: anytype, comptime cb: fn (@TypeOf(ctx)) void) void {
+        \\    _ = .{ ctx, cb };
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z023));
+}
+
+test "Z023: io param after runtime value is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn good(path: []const u8, io: std.Io) void {
+        \\    _ = .{ path, io };
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z023));
 }
 
 test "Z024: detect line exceeding 120 bytes" {
