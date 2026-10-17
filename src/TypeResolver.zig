@@ -661,7 +661,7 @@ fn resolveNodeType(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Index, 
         .optional_type => .{ .optional = .{ .child = null } },
         .ptr_type_aligned, .ptr_type_sentinel, .ptr_type, .ptr_type_bit_range => self.resolvePtrType(tree, node),
         .error_union => .{ .error_union = .{ .payload = null } },
-        .error_set_decl => .error_set,
+        .error_set_decl, .merge_error_sets => .error_set,
         .array_type, .array_type_sentinel => .{ .array = .{ .child = null, .len = null } },
         else => .unknown,
     };
