@@ -4126,6 +4126,30 @@ test "Z010: detect explicit enum in return" {
     try std.testing.expectEqual(1, linter.diagnosticCount(.Z010));
 }
 
+test "Z010: allow merged error set members in return" {
+    const source =
+        \\pub const E = error{Oops} || error{};
+        \\pub fn main() E!void {
+        \\    return E.Oops;
+        \\}
+    ;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
+    defer graph.deinit();
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    var linter: Linter = .initWithSemantics(std.testing.allocator, source, path, &resolver, path, null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z010));
+}
+
 test "Z010: allow anonymous enum in return" {
     var linter: Linter = .init(std.testing.allocator, "fn foo() Mode { return .fast; }", "test.zig", null);
     defer linter.deinit();
