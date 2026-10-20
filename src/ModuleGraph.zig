@@ -24,7 +24,7 @@ pub const Module = struct {
 };
 
 pub fn init(allocator: std.mem.Allocator, io: std.Io, root_source: []const u8, zig_lib_path: ?[]const u8) !ModuleGraph {
-    const root_dir = std.fs.path.dirname(root_source) orelse ".";
+    const root_dir = std.Io.Dir.path.dirname(root_source) orelse ".";
 
     var graph: ModuleGraph = .{
         .allocator = allocator,
@@ -203,7 +203,7 @@ fn resolveImportPath(self: *ModuleGraph, import_str: []const u8, module_path: []
     // Handle "std" import - add it to the graph but don't recurse into its imports
     if (std.mem.eql(u8, import_str, "std")) {
         const lib_path = self.zig_lib_path orelse return null;
-        const path = try std.fs.path.join(self.allocator, &.{ lib_path, "std", "std.zig" });
+        const path = try std.Io.Dir.path.join(self.allocator, &.{ lib_path, "std", "std.zig" });
         return path;
     }
 
@@ -223,8 +223,8 @@ fn resolveImportPath(self: *ModuleGraph, import_str: []const u8, module_path: []
 
     // Handle relative .zig imports
     if (std.mem.endsWith(u8, import_str, ".zig")) {
-        const module_dir = std.fs.path.dirname(module_path) orelse ".";
-        const path = try std.fs.path.join(self.allocator, &.{ module_dir, import_str });
+        const module_dir = std.Io.Dir.path.dirname(module_path) orelse ".";
+        const path = try std.Io.Dir.path.join(self.allocator, &.{ module_dir, import_str });
         return path;
     }
 

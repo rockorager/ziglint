@@ -88,7 +88,7 @@ fn findProjectRoot(io: std.Io, start_path: []const u8) ?[]const u8 {
     var path = start_path;
     while (true) {
         // Check if build.zig exists in this directory
-        const build_zig = std.fs.path.join(std.heap.page_allocator, &.{ path, "build.zig" }) catch return null;
+        const build_zig = std.Io.Dir.path.join(std.heap.page_allocator, &.{ path, "build.zig" }) catch return null;
         defer std.heap.page_allocator.free(build_zig);
 
         if (std.Io.Dir.cwd().access(io, build_zig, .{})) |_| {
@@ -96,7 +96,7 @@ fn findProjectRoot(io: std.Io, start_path: []const u8) ?[]const u8 {
         } else |_| {}
 
         // Move up one directory
-        const parent = std.fs.path.dirname(path) orelse return null;
+        const parent = std.Io.Dir.path.dirname(path) orelse return null;
         if (std.mem.eql(u8, parent, path)) return null; // at root
         path = parent;
     }
@@ -107,7 +107,7 @@ fn makeRelativePath(path: []const u8, project_root: ?[]const u8) []const u8 {
     if (std.mem.startsWith(u8, path, root)) {
         var rel = path[root.len..];
         // Skip leading path separator
-        if (rel.len > 0 and rel[0] == std.fs.path.sep) {
+        if (rel.len > 0 and rel[0] == std.Io.Dir.path.sep) {
             rel = rel[1..];
         }
         if (rel.len > 0) return rel;
@@ -283,7 +283,7 @@ fn lintDirectory(allocator: std.mem.Allocator, io: std.Io, path: []const u8, zig
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.basename, ".zig")) continue;
 
-        const full_path = std.fs.path.join(allocator, &.{ path, entry.path }) catch continue;
+        const full_path = std.Io.Dir.path.join(allocator, &.{ path, entry.path }) catch continue;
         files.append(allocator, full_path) catch {
             allocator.free(full_path);
             continue;
@@ -356,7 +356,7 @@ fn lintDirectory(allocator: std.mem.Allocator, io: std.Io, path: []const u8, zig
 }
 
 fn shouldSkip(path: []const u8, gitignore: ?[]const u8) bool {
-    var iter = std.mem.splitScalar(u8, path, std.fs.path.sep);
+    var iter = std.mem.splitScalar(u8, path, std.Io.Dir.path.sep);
     while (iter.next()) |component| {
         if (std.mem.startsWith(u8, component, ".")) return true;
         if (std.mem.eql(u8, component, "zig-cache")) return true;
@@ -385,7 +385,7 @@ fn matchesGitignore(path: []const u8, pattern: []const u8) bool {
         return std.mem.startsWith(u8, path, clean_pattern[1..]);
     }
 
-    var iter = std.mem.splitScalar(u8, path, std.fs.path.sep);
+    var iter = std.mem.splitScalar(u8, path, std.Io.Dir.path.sep);
     while (iter.next()) |component| {
         if (std.mem.eql(u8, component, clean_pattern)) return true;
     }

@@ -591,7 +591,7 @@ fn checkThisBuiltin(self: *Linter) void {
 
         // Check 3: If at file level, alias should match filename or be Self
         if (self.isAtFileLevel(node)) {
-            const basename = std.fs.path.basename(self.path);
+            const basename = std.Io.Dir.path.basename(self.path);
             const expected = if (std.mem.endsWith(u8, basename, ".zig"))
                 basename[0 .. basename.len - 4]
             else
@@ -906,7 +906,7 @@ fn checkFileAsStruct(self: *Linter) void {
     if (!has_top_level_fields) return;
 
     // File has top-level fields, check if filename is PascalCase
-    const basename = std.fs.path.basename(self.path);
+    const basename = std.Io.Dir.path.basename(self.path);
     const name = if (std.mem.endsWith(u8, basename, ".zig"))
         basename[0 .. basename.len - 4]
     else
@@ -1159,7 +1159,7 @@ fn getContainerMembers(
 }
 
 fn isSelfType(self: *Linter, name: []const u8) bool {
-    const basename = std.fs.path.basename(self.path);
+    const basename = std.Io.Dir.path.basename(self.path);
     const stem = if (std.mem.endsWith(u8, basename, ".zig"))
         basename[0 .. basename.len - 4]
     else
@@ -2874,6 +2874,7 @@ fn checkDeprecatedCall(self: *Linter, node: Ast.Node.Index) void {
 
     var method_def: ?TypeResolver.MethodDef = null;
     var stdlib_decl: ?TypeResolver.MethodDef = null;
+    var stdlib_path: ?[]const u8 = null;
     var name_token: Ast.TokenIndex = undefined;
     var fn_name: []const u8 = undefined;
 
@@ -2888,8 +2889,12 @@ fn checkDeprecatedCall(self: *Linter, node: Ast.Node.Index) void {
 
         // For stdlib types, also get the declaration without following aliases
         // (the alias itself may be deprecated, like std.ArrayListUnmanaged)
-        if (receiver_type == .std_type) {
-            stdlib_decl = resolver.findStdlibDecl(receiver_type.std_type.path, fn_name);
+        switch (receiver_type) {
+            .std_type => |s| {
+                stdlib_path = s.path;
+                stdlib_decl = resolver.findStdlibDecl(s.path, fn_name);
+            },
+            else => {},
         }
     } else if (fn_expr_tag == .identifier) {
         // Direct function call in the same module (e.g., `DeprecatedFunc()`)
@@ -2909,11 +2914,43 @@ fn checkDeprecatedCall(self: *Linter, node: Ast.Node.Index) void {
 
     // Also check the stdlib declaration itself (for deprecated aliases like std.ArrayListUnmanaged)
     if (stdlib_decl) |decl| {
-        _ = self.checkDefDeprecation(decl, name_token, fn_name);
+        if (self.checkDefDeprecation(decl, name_token, fn_name)) return;
+    }
+
+    // The deprecation may live on an enclosing module instead of the called
+    // function, as with `std.fs.path`.
+    if (stdlib_path) |path| {
+        self.checkStdlibNamespaceDeprecation(path, name_token);
     }
 }
 
-fn checkDefDeprecation(self: *Linter, def: TypeResolver.MethodDef, name_token: Ast.TokenIndex, fn_name: []const u8) bool {
+/// Reports calls made through a deprecated stdlib namespace.
+///
+/// A module deprecation is documented on the namespace declaration itself
+/// (`/// Deprecated, use ...` above `pub const path = @import(...)`), so
+/// checking only the called declaration misses `std.fs.path.basename(path)`.
+fn checkStdlibNamespaceDeprecation(self: *Linter, path: []const u8, name_token: Ast.TokenIndex) void {
+    const resolver = self.type_resolver orelse return;
+
+    var end = path.len;
+    while (end > 0) {
+        const dot = std.mem.findScalarLast(u8, path[0..end], '.');
+        const parent = if (dot) |i| path[0..i] else "";
+        const name = if (dot) |i| path[i + 1 .. end] else path[0..end];
+
+        if (resolver.findStdlibDecl(parent, name)) |decl| {
+            // Name the namespace (`std.fs.path`) in the message, not the
+            // function that is not itself deprecated.
+            const namespace = std.fmt.allocPrint(self.allocator, "std.{s}", .{path[0..end]}) catch return;
+            defer self.allocator.free(namespace);
+            if (self.checkDefDeprecation(decl, name_token, namespace)) return;
+        }
+
+        end = dot orelse 0;
+    }
+}
+
+fn checkDefDeprecation(self: *Linter, def: TypeResolver.MethodDef, name_token: Ast.TokenIndex, display_name: []const u8) bool {
     const resolver = self.type_resolver orelse return false;
     const mod = resolver.graph.getModule(def.module_path) orelse return false;
 
@@ -2927,7 +2964,7 @@ fn checkDefDeprecation(self: *Linter, def: TypeResolver.MethodDef, name_token: A
         defer self.allocator.free(doc);
 
         const loc = self.tree.tokenLocation(0, name_token);
-        const msg = std.fmt.allocPrint(self.allocator, "'{s}' is deprecated: {s}", .{ fn_name, doc }) catch return false;
+        const msg = std.fmt.allocPrint(self.allocator, "'{s}' is deprecated: {s}", .{ display_name, doc }) catch return false;
         self.allocated_contexts.append(self.allocator, msg) catch {
             self.allocator.free(msg);
             return false;
@@ -2951,7 +2988,7 @@ fn checkDefDeprecation(self: *Linter, def: TypeResolver.MethodDef, name_token: A
         self.deprecation_cache.put(self.allocator, cache_key, true) catch return true;
 
         const loc = self.tree.tokenLocation(0, name_token);
-        const msg = std.fmt.allocPrint(self.allocator, "'{s}' is deprecated: {s}", .{ fn_name, doc }) catch return false;
+        const msg = std.fmt.allocPrint(self.allocator, "'{s}' is deprecated: {s}", .{ display_name, doc }) catch return false;
         self.allocated_contexts.append(self.allocator, msg) catch {
             self.allocator.free(msg);
             return false;
@@ -2972,7 +3009,7 @@ fn containsDeprecated(text: []const u8) bool {
         if (std.ascii.startsWithIgnoreCase(line, "deprecated")) {
             if (line.len == "deprecated".len) return true;
             const separator = line["deprecated".len];
-            if (separator == ':' or separator == ';' or separator == '.' or separator == ' ') return true;
+            if (separator == ':' or separator == ';' or separator == ',' or separator == '.' or separator == ' ') return true;
         }
         if (std.ascii.startsWithIgnoreCase(line, "this function is deprecated")) return true;
     }
@@ -4833,6 +4870,61 @@ test "Z011: detect deprecated stdlib function (ArrayListUnmanaged)" {
     try std.testing.expect(found_z011);
 }
 
+test "Z011: detect deprecated stdlib namespace" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    // Fake stdlib: the deprecation is on the `path` module declaration, not
+    // on the function inside it.
+    try tmp_dir.dir.createDirPath(std.testing.io, "lib/std/fs");
+    try tmp_dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "lib/std/std.zig",
+        .data =
+        \\pub const fs = @import("fs.zig");
+        ,
+    });
+    try tmp_dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "lib/std/fs.zig",
+        .data =
+        \\/// Deprecated, use `std.Io.Dir.path`.
+        \\pub const path = @import("fs/path.zig");
+        ,
+    });
+    try tmp_dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "lib/std/fs/path.zig",
+        .data =
+        \\pub fn basename(path: []const u8) []const u8 {
+        \\    return path;
+        \\}
+        ,
+    });
+
+    const source =
+        \\const std = @import("std");
+        \\pub fn main() void {
+        \\    _ = std.fs.path.basename("a/b");
+        \\}
+    ;
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    const zig_lib_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "lib", std.testing.allocator);
+    defer std.testing.allocator.free(zig_lib_path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, zig_lib_path);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    var linter: Linter = .initWithSemantics(std.testing.allocator, source, path, &resolver, path, null);
+    defer linter.deinit();
+    linter.lint();
+
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z011));
+}
+
 test "Z011: deprecated stdlib corpus - real Zig 0.15.2 deprecations" {
     const builtin = @import("builtin");
     if (builtin.zig_version.major == 0 and builtin.zig_version.minor >= 16) return;
@@ -5043,6 +5135,7 @@ test "Z011: deprecated stdlib corpus - real Zig 0.15.2 deprecations" {
 test "containsDeprecated" {
     try std.testing.expect(containsDeprecated("Deprecated: use X instead"));
     try std.testing.expect(containsDeprecated("deprecated; use X instead"));
+    try std.testing.expect(containsDeprecated("Deprecated, use X instead"));
     try std.testing.expect(containsDeprecated("Summary\nDeprecated in favor of X"));
     try std.testing.expect(containsDeprecated("This function is deprecated; use X"));
     try std.testing.expect(!containsDeprecated("This function is useful"));

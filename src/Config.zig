@@ -64,7 +64,7 @@ fn findConfigFile(allocator: std.mem.Allocator, io: std.Io, start_path: ?[]const
             return config_path;
         }
 
-        const parent = std.fs.path.dirname(current) orelse break;
+        const parent = std.Io.Dir.path.dirname(current) orelse break;
         if (std.mem.eql(u8, parent, current)) break;
         current = parent;
     }
@@ -73,7 +73,7 @@ fn findConfigFile(allocator: std.mem.Allocator, io: std.Io, start_path: ?[]const
 }
 
 fn findConfigInDir(allocator: std.mem.Allocator, io: std.Io, dir_path: []const u8) !?[]const u8 {
-    const config_path = try std.fs.path.join(allocator, &.{ dir_path, ".ziglint.zon" });
+    const config_path = try std.Io.Dir.path.join(allocator, &.{ dir_path, ".ziglint.zon" });
     errdefer allocator.free(config_path);
 
     std.Io.Dir.cwd().access(io, config_path, .{}) catch {

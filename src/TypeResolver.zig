@@ -200,7 +200,7 @@ pub fn findFnInCurrentModule(self: *TypeResolver, module_path: []const u8, fn_na
 pub fn findStdlibDecl(self: *TypeResolver, path: []const u8, name: []const u8) ?MethodDef {
     const lib_path = self.graph.zig_lib_path orelse return null;
 
-    const std_path = std.fs.path.join(self.allocator, &.{ lib_path, "std", "std.zig" }) catch return null;
+    const std_path = std.Io.Dir.path.join(self.allocator, &.{ lib_path, "std", "std.zig" }) catch return null;
     defer self.allocator.free(std_path);
 
     // For empty path, look directly in std.zig
@@ -353,7 +353,7 @@ fn findMethodInStdlib(self: *TypeResolver, path: []const u8, method_name: []cons
     const lib_path = self.graph.zig_lib_path orelse return null;
 
     // Start at std.zig (lib_dir/std/std.zig)
-    const std_path = std.fs.path.join(self.allocator, &.{ lib_path, "std", "std.zig" }) catch return null;
+    const std_path = std.Io.Dir.path.join(self.allocator, &.{ lib_path, "std", "std.zig" }) catch return null;
     defer self.allocator.free(std_path);
 
     // For empty path (direct std.X access), look in std.zig directly
@@ -438,8 +438,8 @@ fn findDeclInModule(self: *TypeResolver, tree: *const Ast, name: []const u8, mod
 
                         const import_str = raw_path[1 .. raw_path.len - 1];
                         if (std.mem.endsWith(u8, import_str, ".zig")) {
-                            const module_dir = std.fs.path.dirname(module_path) orelse ".";
-                            const resolved = std.fs.path.join(self.allocator, &.{ module_dir, import_str }) catch continue;
+                            const module_dir = std.Io.Dir.path.dirname(module_path) orelse ".";
+                            const resolved = std.Io.Dir.path.join(self.allocator, &.{ module_dir, import_str }) catch continue;
                             const canonical = std.Io.Dir.cwd().realPathFileAlloc(self.graph.io, resolved, self.allocator) catch {
                                 self.allocator.free(resolved);
                                 continue;
@@ -1004,8 +1004,8 @@ fn resolveBuiltinCall(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Inde
             // Resolve the import against the importing module's directory and
             // borrow the graph's canonical path, so module_path names the
             // imported module — not, as before, the importing one.
-            const module_dir = std.fs.path.dirname(module_path) orelse ".";
-            const joined = std.fs.path.join(self.allocator, &.{ module_dir, import_str }) catch return .unknown;
+            const module_dir = std.Io.Dir.path.dirname(module_path) orelse ".";
+            const joined = std.Io.Dir.path.join(self.allocator, &.{ module_dir, import_str }) catch return .unknown;
             defer self.allocator.free(joined);
             if (self.graph.getModule(joined)) |mod| {
                 // A name ending in ".zig" marks a module import; container decl
