@@ -198,6 +198,7 @@ pub fn lint(self: *Linter) void {
     self.checkCatchReturnAll();
     self.checkEmptyCatchAll();
     self.checkInstanceDeclAccess();
+    self.checkPrintLiteralArgs();
 
     if (self.verbose and timer != null) {
         const elapsed = timerRead(self.io.?, timer.?) - checks_start;
@@ -2204,6 +2205,377 @@ fn checkInstanceDeclAccess(self: *Linter) void {
         self.trackContext(context);
         self.report(loc, .Z027, context);
     }
+}
+
+/// Z034: `writer.print("literal", .{})` performs no formatting. On an
+/// `Io.Writer`, `writeAll` states the intent directly.
+///
+/// The receiver must resolve to `std.Io.Writer`. An unresolved receiver is
+/// skipped: custom `print` methods (for example `std.json.Stringify.print`)
+/// have the same call shape but no `writeAll` alternative.
+fn checkPrintLiteralArgs(self: *Linter) void {
+    if (!self.config.isRuleEnabled(.Z034)) return;
+
+    for (0..self.tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @enumFromInt(i);
+        const tag = self.tree.nodeTag(node);
+        if (tag != .call and tag != .call_comma) continue;
+
+        var call_buf: [1]Ast.Node.Index = undefined;
+        const call = self.tree.fullCall(&call_buf, node) orelse continue;
+        if (call.ast.params.len != 2) continue;
+
+        const callee = call.ast.fn_expr;
+        if (self.tree.nodeTag(callee) != .field_access) continue;
+        const callee_data = self.tree.nodeData(callee).node_and_token;
+        const method_token = callee_data[1];
+        if (!std.mem.eql(u8, self.tree.tokenSlice(method_token), "print")) continue;
+
+        if (!self.isFormatlessStringLiteral(call.ast.params[0])) continue;
+        if (!self.isEmptyArgsTuple(call.ast.params[1])) continue;
+        if (!self.isIoWriterExpr(node, callee_data[0])) continue;
+
+        const loc = self.tree.tokenLocation(0, method_token);
+        self.report(loc, .Z034, "");
+    }
+}
+
+/// Returns true when the argument is a string literal with no format
+/// placeholders. Doubled braces are literal braces, not placeholders.
+fn isFormatlessStringLiteral(self: *Linter, node: Ast.Node.Index) bool {
+    return switch (self.tree.nodeTag(node)) {
+        .string_literal => blk: {
+            const raw = self.tree.tokenSlice(self.tree.nodeMainToken(node));
+            if (raw.len < 2) break :blk false;
+            break :blk !hasFormatPlaceholder(raw[1 .. raw.len - 1], true);
+        },
+        .multiline_string_literal => blk: {
+            const first = self.tree.firstToken(node);
+            const last = self.tree.lastToken(node);
+            var token = first;
+            while (token <= last) : (token += 1) {
+                const raw = self.tree.tokenSlice(token);
+                // Multiline string bodies do not process backslash escapes.
+                const body = if (std.mem.startsWith(u8, raw, "\\\\")) raw[2..] else raw;
+                if (hasFormatPlaceholder(body, false)) break :blk false;
+            }
+            break :blk true;
+        },
+        else => false,
+    };
+}
+
+fn hasFormatPlaceholder(raw: []const u8, escapes: bool) bool {
+    var i: usize = 0;
+    while (i < raw.len) {
+        const c = raw[i];
+        if (escapes and c == '\\') {
+            i += 2;
+            continue;
+        }
+        if ((c == '{' or c == '}') and i + 1 < raw.len and raw[i + 1] == c) {
+            i += 2;
+            continue;
+        }
+        if (c == '{' or c == '}') return true;
+        i += 1;
+    }
+    return false;
+}
+
+/// `.{}` is an anonymous empty struct init. A named empty struct (`Foo{}`)
+/// also works as an args tuple but is not what this rule targets.
+fn isEmptyArgsTuple(self: *Linter, node: Ast.Node.Index) bool {
+    var init_buf: [2]Ast.Node.Index = undefined;
+    const struct_init = self.tree.fullStructInit(&init_buf, node) orelse return false;
+    return struct_init.ast.fields.len == 0 and struct_init.ast.type_expr.unwrap() == null;
+}
+
+fn isIoWriterExpr(self: *Linter, use_site: Ast.Node.Index, expr: Ast.Node.Index) bool {
+    const tag = self.tree.nodeTag(expr);
+    switch (tag) {
+        .identifier => {
+            const name = self.tree.tokenSlice(self.tree.nodeMainToken(expr));
+            const type_node = self.lookupScopedTypeNode(use_site, name) orelse return false;
+            return self.isIoWriterType(type_node);
+        },
+        .address_of => {
+            const inner = self.tree.nodeData(expr).node;
+            return self.isIoWriterExpr(use_site, inner);
+        },
+        .field_access => {
+            const data = self.tree.nodeData(expr).node_and_token;
+            const field_name = self.tree.tokenSlice(data[1]);
+            const field_type = self.lookupReceiverFieldType(use_site, data[0], field_name) orelse return false;
+            return self.isIoWriterType(field_type);
+        },
+        else => return false,
+    }
+}
+
+/// Finds a parameter or local declaration with an explicit type annotation.
+/// Declarations are searched from the innermost block outward; a nested
+/// function cannot capture outer locals, so the search stops there.
+fn lookupScopedTypeNode(self: *Linter, use_site: Ast.Node.Index, name: []const u8) ?Ast.Node.Index {
+    var current = use_site;
+    var reached_fn = false;
+    while (true) {
+        const parent = self.parent_map[@intFromEnum(current)].unwrap() orelse break;
+        switch (self.tree.nodeTag(parent)) {
+            .block, .block_semicolon => {
+                var block_buf: [2]Ast.Node.Index = undefined;
+                if (self.tree.blockStatements(&block_buf, parent)) |stmts| {
+                    if (self.findVarDeclTypeIn(stmts, use_site, name)) |type_node| return type_node;
+                }
+            },
+            .block_two, .block_two_semicolon => {
+                const data = self.tree.nodeData(parent).opt_node_and_opt_node;
+                if (data[0].unwrap()) |stmt| {
+                    if (self.findVarDeclTypeIn(&.{stmt}, use_site, name)) |type_node| return type_node;
+                }
+                if (data[1].unwrap()) |stmt| {
+                    if (self.findVarDeclTypeIn(&.{stmt}, use_site, name)) |type_node| return type_node;
+                }
+            },
+            .fn_decl => {
+                reached_fn = true;
+                if (self.findParamTypeNode(parent, name)) |type_node| return type_node;
+                break;
+            },
+            else => {},
+        }
+        current = parent;
+    }
+
+    // The parent map does not connect every wrapper (switch prongs, return
+    // expressions). Fall back to the innermost function that contains the
+    // use site.
+    if (!reached_fn) {
+        if (self.findEnclosingFnByToken(use_site)) |fn_decl| {
+            if (self.findParamTypeNode(fn_decl, name)) |type_node| return type_node;
+            return self.findLocalTypeNodeNear(fn_decl, use_site, name);
+        }
+    }
+    return self.findTopLevelTypeNode(name);
+}
+
+fn findEnclosingFnByToken(self: *Linter, use_site: Ast.Node.Index) ?Ast.Node.Index {
+    const use_token = self.tree.nodeMainToken(use_site);
+    var best: ?Ast.Node.Index = null;
+    var best_start: Ast.TokenIndex = 0;
+    for (0..self.tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @enumFromInt(i);
+        if (self.tree.nodeTag(node) != .fn_decl) continue;
+        const start = self.tree.firstToken(node);
+        const end = self.tree.lastToken(node);
+        if (start <= use_token and use_token <= end and (best == null or start >= best_start)) {
+            best = node;
+            best_start = start;
+        }
+    }
+    return best;
+}
+
+/// Nearest preceding local with this name inside the function. Shadowing is
+/// forbidden in Zig, so at most one declaration can be in scope.
+fn findLocalTypeNodeNear(self: *Linter, fn_decl: Ast.Node.Index, use_site: Ast.Node.Index, name: []const u8) ?Ast.Node.Index {
+    const use_token = self.tree.nodeMainToken(use_site);
+    const fn_start = self.tree.firstToken(fn_decl);
+    const fn_end = self.tree.lastToken(fn_decl);
+
+    var found: ?Ast.Node.Index = null;
+    var found_token: Ast.TokenIndex = 0;
+    for (0..self.tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @enumFromInt(i);
+        const var_decl = self.tree.fullVarDecl(node) orelse continue;
+        const name_token = var_decl.ast.mut_token + 1;
+        if (!std.mem.eql(u8, self.tree.tokenSlice(name_token), name)) continue;
+        const decl_token = self.tree.nodeMainToken(node);
+        if (decl_token < fn_start or decl_token > fn_end) continue;
+        if (decl_token > use_token) continue;
+        if (found == null or decl_token > found_token) {
+            found = var_decl.ast.type_node.unwrap();
+            found_token = decl_token;
+        }
+    }
+    return found;
+}
+
+fn findVarDeclTypeIn(self: *Linter, stmts: []const Ast.Node.Index, use_site: Ast.Node.Index, name: []const u8) ?Ast.Node.Index {
+    for (stmts) |stmt| {
+        const var_decl = self.tree.fullVarDecl(stmt) orelse continue;
+        const name_token = var_decl.ast.mut_token + 1;
+        if (!std.mem.eql(u8, self.tree.tokenSlice(name_token), name)) continue;
+        // A declaration after the use cannot be the referent.
+        if (self.tree.nodeMainToken(stmt) > self.tree.nodeMainToken(use_site)) continue;
+        return var_decl.ast.type_node.unwrap();
+    }
+    return null;
+}
+
+fn findParamTypeNode(self: *Linter, fn_decl: Ast.Node.Index, name: []const u8) ?Ast.Node.Index {
+    var proto_buf: [1]Ast.Node.Index = undefined;
+    const fn_proto = self.tree.fullFnProto(&proto_buf, fn_decl) orelse return null;
+    var it = fn_proto.iterate(&self.tree);
+    while (it.next()) |param| {
+        const name_token = param.name_token orelse continue;
+        if (!std.mem.eql(u8, self.tree.tokenSlice(name_token), name)) continue;
+        return param.type_expr;
+    }
+    return null;
+}
+
+fn findTopLevelTypeNode(self: *Linter, name: []const u8) ?Ast.Node.Index {
+    const var_decl = self.findTopLevelVarDecl(name) orelse return null;
+    return var_decl.ast.type_node.unwrap();
+}
+
+fn findTopLevelVarDecl(self: *Linter, name: []const u8) ?Ast.full.VarDecl {
+    for (self.tree.rootDecls()) |decl| {
+        const var_decl = self.tree.fullVarDecl(decl) orelse continue;
+        const name_token = var_decl.ast.mut_token + 1;
+        if (!std.mem.eql(u8, self.tree.tokenSlice(name_token), name)) continue;
+        return var_decl;
+    }
+    return null;
+}
+
+/// Resolves `base.field` for `self.field` and for fields of a user type that
+/// the current file declares. Standard-library field types are not resolved.
+fn lookupReceiverFieldType(self: *Linter, use_site: Ast.Node.Index, base: Ast.Node.Index, field_name: []const u8) ?Ast.Node.Index {
+    if (self.tree.nodeTag(base) != .identifier) return null;
+    const base_name = self.tree.tokenSlice(self.tree.nodeMainToken(base));
+
+    var container: Ast.Node.Index = undefined;
+    if (std.mem.eql(u8, base_name, "self") or std.mem.eql(u8, base_name, "Self")) {
+        container = self.findEnclosingContainer(use_site).unwrap() orelse return null;
+    } else {
+        const base_type = self.lookupScopedTypeNode(use_site, base_name) orelse return null;
+        const unwrapped = self.stripTypeWrappers(base_type);
+        if (self.tree.nodeTag(unwrapped) != .identifier) return null;
+        const type_name = self.tree.tokenSlice(self.tree.nodeMainToken(unwrapped));
+        container = self.findTopLevelContainerDecl(type_name) orelse return null;
+    }
+    return self.findContainerFieldTypeNode(container, field_name);
+}
+
+fn findTopLevelContainerDecl(self: *Linter, name: []const u8) ?Ast.Node.Index {
+    const var_decl = self.findTopLevelVarDecl(name) orelse return null;
+    const init_node = var_decl.ast.init_node.unwrap() orelse return null;
+    var container_buf: [2]Ast.Node.Index = undefined;
+    if (self.tree.fullContainerDecl(&container_buf, init_node) == null) return null;
+    return init_node;
+}
+
+fn findContainerFieldTypeNode(self: *Linter, container_node: Ast.Node.Index, field_name: []const u8) ?Ast.Node.Index {
+    var container_buf: [2]Ast.Node.Index = undefined;
+    const container = self.tree.fullContainerDecl(&container_buf, container_node) orelse return null;
+    for (container.ast.members) |member| {
+        const field = self.tree.fullContainerField(member) orelse continue;
+        if (!std.mem.eql(u8, self.tree.tokenSlice(field.ast.main_token), field_name)) continue;
+        return field.ast.type_expr.unwrap();
+    }
+    return null;
+}
+
+fn stripTypeWrappers(self: *Linter, type_node: Ast.Node.Index) Ast.Node.Index {
+    var node = type_node;
+    while (true) {
+        switch (self.tree.nodeTag(node)) {
+            .ptr_type_aligned, .ptr_type_sentinel, .ptr_type, .ptr_type_bit_range => {
+                const ptr = self.tree.fullPtrType(node) orelse return node;
+                node = ptr.ast.child_type;
+            },
+            .optional_type => node = self.tree.nodeData(node).node,
+            .error_union => node = self.tree.nodeData(node).node_and_node[0],
+            else => return node,
+        }
+    }
+}
+
+fn isIoWriterType(self: *Linter, type_node: Ast.Node.Index) bool {
+    const unwrapped = self.stripTypeWrappers(type_node);
+
+    if (self.type_resolver) |resolver| {
+        if (self.module_path) |mod_path| {
+            const info = resolver.typeOf(mod_path, unwrapped);
+            // Only a confirmed match short-circuits. Alias chains such as
+            // `const Io = std.Io;` resolve to an incomplete path in the
+            // resolver, so fall through to the syntactic alias walk.
+            if (info == .std_type and std.mem.eql(u8, info.std_type.path, "Io.Writer")) {
+                return true;
+            }
+        }
+    }
+
+    // Unit tests and files without semantic analysis use the syntactic path.
+    return self.isIoWriterTypePath(unwrapped, 0);
+}
+
+/// Syntactic fallback for `std.Io.Writer`, including local aliases such as
+/// `const Writer = std.Io.Writer;` and `const Io = std.Io;`.
+fn isIoWriterTypePath(self: *Linter, node: Ast.Node.Index, depth: u8) bool {
+    if (depth > 8) return false;
+    switch (self.tree.nodeTag(node)) {
+        .identifier => {
+            const name = self.tree.tokenSlice(self.tree.nodeMainToken(node));
+            const alias_init = self.findTopLevelAliasInit(name) orelse return false;
+            return self.isIoWriterTypePath(self.stripTypeWrappers(alias_init), depth + 1);
+        },
+        .field_access => {
+            const data = self.tree.nodeData(node).node_and_token;
+            if (!std.mem.eql(u8, self.tree.tokenSlice(data[1]), "Writer")) return false;
+            return self.isStdIoRef(data[0], depth + 1);
+        },
+        else => return false,
+    }
+}
+
+fn isStdIoRef(self: *Linter, node: Ast.Node.Index, depth: u8) bool {
+    if (depth > 8) return false;
+    switch (self.tree.nodeTag(node)) {
+        .identifier => {
+            const name = self.tree.tokenSlice(self.tree.nodeMainToken(node));
+            if (self.findTopLevelAliasInit(name)) |alias_init| {
+                return self.isStdIoRef(self.stripTypeWrappers(alias_init), depth + 1);
+            }
+            // `Io.Writer` is the conventional alias for `std.Io.Writer`.
+            return std.mem.eql(u8, name, "Io");
+        },
+        .field_access => {
+            const data = self.tree.nodeData(node).node_and_token;
+            if (!std.mem.eql(u8, self.tree.tokenSlice(data[1]), "Io")) return false;
+            return self.isStdImportRef(data[0], depth + 1);
+        },
+        else => return false,
+    }
+}
+
+fn isStdImportRef(self: *Linter, node: Ast.Node.Index, depth: u8) bool {
+    if (depth > 8) return false;
+    if (self.tree.nodeTag(node) != .identifier) return false;
+    const name = self.tree.tokenSlice(self.tree.nodeMainToken(node));
+    if (std.mem.eql(u8, name, "std")) return true;
+    const alias_init = self.findTopLevelAliasInit(name) orelse return false;
+    return self.isStdImportCall(alias_init);
+}
+
+fn isStdImportCall(self: *Linter, node: Ast.Node.Index) bool {
+    const tag = self.tree.nodeTag(node);
+    if (tag != .builtin_call_two and tag != .builtin_call_two_comma) return false;
+    const main_token = self.tree.nodeMainToken(node);
+    if (!std.mem.eql(u8, self.tree.tokenSlice(main_token), "@import")) return false;
+
+    var params_buf: [2]Ast.Node.Index = undefined;
+    const params = self.tree.builtinCallParams(&params_buf, node) orelse return false;
+    if (params.len != 1) return false;
+    if (self.tree.nodeTag(params[0]) != .string_literal) return false;
+    return std.mem.eql(u8, self.tree.tokenSlice(self.tree.nodeMainToken(params[0])), "\"std\"");
+}
+
+fn findTopLevelAliasInit(self: *Linter, name: []const u8) ?Ast.Node.Index {
+    const var_decl = self.findTopLevelVarDecl(name) orelse return null;
+    return var_decl.ast.init_node.unwrap();
 }
 
 fn isEmptyBlock(self: *Linter, node: Ast.Node.Index) bool {
@@ -7198,4 +7570,183 @@ test "Z033: allow normal names when enabled" {
     defer linter.deinit();
     linter.lint();
     try std.testing.expectEqual(0, linter.diagnosticCount(.Z033));
+}
+
+test "Z034: detect print with literal and empty args" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn render(writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        \\    try writer.print("hello\n", .{});
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z034));
+}
+
+test "Z034: detect multiline literal" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn render(writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        \\    try writer.print(
+        \\        \\hello
+        \\        \\world
+        \\    , .{});
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z034));
+}
+
+test "Z034: detect escaped braces" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn render(writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        \\    try writer.print("{{}}", .{});
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z034));
+}
+
+test "Z034: detect Io alias" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const Io = std.Io;
+        \\fn render(writer: *Io.Writer) !void {
+        \\    try writer.print("hello", .{});
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z034));
+}
+
+test "Z034: detect top-level typed writer" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\var out: *std.Io.Writer = undefined;
+        \\fn render() !void {
+        \\    try out.print("hello", .{});
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z034));
+}
+
+test "Z034: detect self.writer field" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const Renderer = struct {
+        \\    writer: *std.Io.Writer,
+        \\    fn render(self: *Renderer) !void {
+        \\        try self.writer.print("hello", .{});
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z034));
+}
+
+test "Z034: allow format placeholders" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn render(writer: *std.Io.Writer) !void {
+        \\    try writer.print("{s}", .{"x"});
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z034));
+}
+
+test "Z034: allow non-empty args" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn render(writer: *std.Io.Writer) !void {
+        \\    try writer.print("hello", .{1});
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z034));
+}
+
+test "Z034: allow writeAll" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn render(writer: *std.Io.Writer) !void {
+        \\    try writer.writeAll("hello");
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z034));
+}
+
+test "Z034: allow std.debug.print" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn render() void {
+        \\    std.debug.print("hello", .{});
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z034));
+}
+
+test "Z034: allow non-writer print method" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn render(stringify: *std.json.Stringify) !void {
+        \\    try stringify.print("hello", .{});
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z034));
+}
+
+test "Z034: allow anytype receiver" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\fn render(writer: anytype) !void {
+        \\    try writer.print("hello", .{});
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z034));
+}
+
+test "Z034: detect call in switch prong" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn render(writer: *std.Io.Writer, value: u32) !void {
+        \\    switch (value) {
+        \\        1 => try writer.print("one", .{}),
+        \\        else => try writer.print("other", .{}),
+        \\    }
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(2, linter.diagnosticCount(.Z034));
+}
+
+test "Z034: detect annotated local writer" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\fn render() !void {
+        \\    var writer: *std.Io.Writer = undefined;
+        \\    try writer.print("hello", .{});
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z034));
 }

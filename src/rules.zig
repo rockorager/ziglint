@@ -35,6 +35,7 @@ pub const Rule = enum(u16) {
     Z031 = 31,
     Z032 = 32,
     Z033 = 33,
+    Z034 = 34,
 
     /// Returns the config struct type for this rule.
     /// All config types have `enabled: bool` (default varies per rule).
@@ -248,6 +249,10 @@ pub const Rule = enum(u16) {
                 const word = if (sep < context.len) context[sep + 1 ..] else "";
                 try writer.print("type name {s}'{s}'{s} contains redundant word {s}'{s}'{s}", .{ y, name, r, y, word, r });
             },
+            // A literal with no placeholders needs no fmt/args pair.
+            .Z034 => {
+                try writer.print("{s}print{s}{s}() has no format placeholders and empty args; use {s}writeAll{s}{s}() instead", .{ b, r, d, b, r, d });
+            },
         }
     }
 };
@@ -428,6 +433,18 @@ test "Z030 uses the receiver name" {
 
     try std.testing.expectEqualStrings(
         "deinit should set value.* = undefined (has early return before invalidation)",
+        output.written(),
+    );
+}
+
+test "Z034 recommends writeAll for literal prints" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try Rule.Z034.writeMessage(&output.writer, "", false);
+
+    try std.testing.expectEqualStrings(
+        "print() has no format placeholders and empty args; use writeAll() instead",
         output.written(),
     );
 }

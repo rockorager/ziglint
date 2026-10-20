@@ -55,6 +55,7 @@ Directories are scanned recursively for `.zig` files.
 | Z031 | Avoid underscore prefix in identifiers |
 | Z032 | Acronyms should use standard casing |
 | Z033 | Avoid redundant words in type names (disabled by default) |
+| Z034 | `Io.Writer.print` with a literal and empty args; use `writeAll` |
 
 ## Configuration
 
