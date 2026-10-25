@@ -192,6 +192,7 @@ pub fn lint(self: *Linter) void {
     }
 
     const checks_start = if (timer) |t| timerRead(self.io.?, t) else 0;
+    self.checkDeprecatedCalls();
     self.checkUnusedImports();
     self.checkThisBuiltin();
     self.checkInlineImports();
@@ -1539,14 +1540,6 @@ fn visitNode(self: *Linter, node: Ast.Node.Index) void {
             self.checkRedundantAsInCallArgs(node);
 
             if (self.rule_timer != null and self.io != null) {
-                const deprecated_start = timerRead(self.io.?, self.rule_timer.?);
-                self.checkDeprecatedCall(node);
-                self.trackRuleTime(.Z011, timerRead(self.io.?, self.rule_timer.?) - deprecated_start);
-            } else {
-                self.checkDeprecatedCall(node);
-            }
-
-            if (self.rule_timer != null and self.io != null) {
                 const assert_start = timerRead(self.io.?, self.rule_timer.?);
                 self.checkCompoundAssert(node);
                 self.trackRuleTime(.Z016, timerRead(self.io.?, self.rule_timer.?) - assert_start);
@@ -2862,6 +2855,30 @@ fn checkCallArgs(self: *Linter, node: Ast.Node.Index) void {
     }
 }
 
+/// Reports every deprecated call in the file.
+///
+/// Z011 sweeps the node table instead of the recursive `visitNode` walk. That
+/// walk stops at function signatures, container fields, and type-only
+/// positions, so `std.meta.Int()` in a return type or struct field would
+/// otherwise go unreported.
+fn checkDeprecatedCalls(self: *Linter) void {
+    if (!self.config.isRuleEnabled(.Z011)) return;
+
+    const start = if (self.rule_timer != null and self.io != null) timerRead(self.io.?, self.rule_timer.?) else 0;
+
+    for (0..self.tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @enumFromInt(i);
+        switch (self.tree.nodeTag(node)) {
+            .call_one, .call_one_comma, .call, .call_comma => self.checkDeprecatedCall(node),
+            else => {},
+        }
+    }
+
+    if (self.rule_timer != null and self.io != null) {
+        self.trackRuleTime(.Z011, timerRead(self.io.?, self.rule_timer.?) - start);
+    }
+}
+
 fn checkDeprecatedCall(self: *Linter, node: Ast.Node.Index) void {
     const resolver = self.type_resolver orelse return;
     const mod_path = self.module_path orelse return;
@@ -2903,6 +2920,12 @@ fn checkDeprecatedCall(self: *Linter, node: Ast.Node.Index) void {
 
         // Look up the function in the current module
         method_def = resolver.findFnInCurrentModule(mod_path, fn_name);
+
+        // The name may alias a stdlib declaration, e.g.
+        // `const copy = std.mem.copyBackwards;`.
+        if (method_def == null) {
+            stdlib_decl = resolver.findStdlibAliasDecl(mod_path, fn_name);
+        }
     } else {
         return;
     }
@@ -3101,7 +3124,7 @@ fn checkRedundantType(self: *Linter, node: Ast.Node.Index, check_field_access: b
         const full_expr = self.getNodeSource(node);
         const type_name = self.tree.tokenSlice(type_token);
         // Find where the type name ends and extract the { ... } part
-        const brace_start = std.mem.indexOf(u8, full_expr, "{") orelse return;
+        const brace_start = std.mem.find(u8, full_expr, "{") orelse return;
         const fields_part = truncateExpr(full_expr[brace_start..]);
         const full_truncated = truncateExpr(full_expr);
         const msg = std.fmt.allocPrint(self.allocator, ".{s}\x00{s}", .{ fields_part, full_truncated }) catch return;
@@ -4825,9 +4848,9 @@ test "Z011: detect deprecated stdlib function (ArrayListUnmanaged)" {
         }
 
         const needle = ".lib_dir = \"";
-        const start_idx = std.mem.indexOf(u8, result.stdout, needle) orelse break :blk null;
+        const start_idx = std.mem.find(u8, result.stdout, needle) orelse break :blk null;
         const value_start = start_idx + needle.len;
-        const end_idx = std.mem.indexOfPos(u8, result.stdout, value_start, "\"") orelse break :blk null;
+        const end_idx = std.mem.findPos(u8, result.stdout, value_start, "\"") orelse break :blk null;
         break :blk std.testing.allocator.dupe(u8, result.stdout[value_start..end_idx]) catch null;
     };
 
@@ -4925,6 +4948,126 @@ test "Z011: detect deprecated stdlib namespace" {
     try std.testing.expectEqual(1, linter.diagnosticCount(.Z011));
 }
 
+test "Z011: detect deprecated stdlib function alias" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.createDirPath(std.testing.io, "lib/std");
+    try tmp_dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "lib/std/std.zig",
+        .data =
+        \\pub const mem = @import("mem.zig");
+        ,
+    });
+    try tmp_dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "lib/std/mem.zig",
+        .data =
+        \\/// Deprecated: use overwrite instead
+        \\pub fn copyForwards(dest: []u8, source: []const u8) void {
+        \\    _ = dest;
+        \\    _ = source;
+        \\}
+        ,
+    });
+
+    const source =
+        \\const std = @import("std");
+        \\const copy = std.mem.copyForwards;
+        \\pub fn main() void {
+        \\    var dest: [2]u8 = undefined;
+        \\    copy(&dest, &.{ 1, 2 });
+        \\}
+    ;
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    const zig_lib_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "lib", std.testing.allocator);
+    defer std.testing.allocator.free(zig_lib_path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, zig_lib_path);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    var linter: Linter = .initWithSemantics(std.testing.allocator, source, path, &resolver, path, null);
+    defer linter.deinit();
+    linter.lint();
+
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z011));
+}
+
+test "Z011: detect deprecated type function in type positions" {
+    // The recursive visitor stops at function signatures, container fields,
+    // and type wrappers. The rule must still report calls in those positions,
+    // including calls on stdlib declarations like `std.meta.Int`.
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.createDirPath(std.testing.io, "lib/std");
+    try tmp_dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "lib/std/std.zig",
+        .data =
+        \\pub const meta = @import("meta.zig");
+        ,
+    });
+    try tmp_dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "lib/std/meta.zig",
+        .data =
+        \\/// Deprecated: use @Int instead
+        \\pub fn Int(comptime signedness: u8, comptime bits: u16) type {
+        \\    _ = signedness;
+        \\    _ = bits;
+        \\    return u32;
+        \\}
+        ,
+    });
+
+    const source =
+        \\const std = @import("std");
+        \\/// Deprecated: use New instead
+        \\pub fn Old(comptime T: type) type {
+        \\    return struct { items: []T };
+        \\}
+        \\const S = struct {
+        \\    field: Old(u8),
+        \\    other: std.meta.Int(.unsigned, 32),
+        \\};
+        \\pub fn f(x: Old(u8)) std.meta.Int(.signed, 32) {
+        \\    _ = x;
+        \\    return 0;
+        \\}
+        \\pub fn g() ?Old(u8) {
+        \\    return null;
+        \\}
+        \\pub fn h() void {
+        \\    const arr = [_]type{Old(u8)};
+        \\    _ = arr;
+        \\}
+    ;
+
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    const zig_lib_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "lib", std.testing.allocator);
+    defer std.testing.allocator.free(zig_lib_path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, zig_lib_path);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    var linter: Linter = .initWithSemantics(std.testing.allocator, source, path, &resolver, path, null);
+    defer linter.deinit();
+    linter.lint();
+
+    // struct field, stdlib struct field, param type, stdlib return type,
+    // optional return type, array element
+    try std.testing.expectEqual(6, linter.diagnosticCount(.Z011));
+}
+
 test "Z011: deprecated stdlib corpus - real Zig 0.15.2 deprecations" {
     const builtin = @import("builtin");
     if (builtin.zig_version.major == 0 and builtin.zig_version.minor >= 16) return;
@@ -4945,9 +5088,9 @@ test "Z011: deprecated stdlib corpus - real Zig 0.15.2 deprecations" {
         }
 
         const needle = ".lib_dir = \"";
-        const start_idx = std.mem.indexOf(u8, result.stdout, needle) orelse break :blk null;
+        const start_idx = std.mem.find(u8, result.stdout, needle) orelse break :blk null;
         const value_start = start_idx + needle.len;
-        const end_idx = std.mem.indexOfPos(u8, result.stdout, value_start, "\"") orelse break :blk null;
+        const end_idx = std.mem.findPos(u8, result.stdout, value_start, "\"") orelse break :blk null;
         break :blk std.testing.allocator.dupe(u8, result.stdout[value_start..end_idx]) catch null;
     };
 

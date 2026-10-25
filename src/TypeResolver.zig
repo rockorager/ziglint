@@ -240,6 +240,41 @@ pub fn findStdlibDecl(self: *TypeResolver, path: []const u8, name: []const u8) ?
     return self.findDeclNodeByName(&mod.tree, name, mod.path);
 }
 
+/// Finds the stdlib declaration aliased by a name in `module_path`.
+///
+/// `findFnInCurrentModule` follows aliases between local declarations, but
+/// cannot follow `const copy = std.mem.copyBackwards;` because the target
+/// lives in the stdlib. Returns null when the name is not such an alias.
+pub fn findStdlibAliasDecl(self: *TypeResolver, module_path: []const u8, name: []const u8) ?MethodDef {
+    self.graph.addModulePublic(module_path);
+    const mod = self.graph.getModule(module_path) orelse return null;
+    const tree = &mod.tree;
+
+    for (tree.rootDecls()) |decl| {
+        const tag = tree.nodeTag(decl);
+        if (tag != .simple_var_decl and tag != .aligned_var_decl and
+            tag != .local_var_decl and tag != .global_var_decl) continue;
+
+        const var_decl = tree.fullVarDecl(decl) orelse continue;
+        const name_token = var_decl.ast.mut_token + 1;
+        if (!std.mem.eql(u8, tree.tokenSlice(name_token), name)) continue;
+
+        const init_node = var_decl.ast.init_node.unwrap() orelse continue;
+        if (tree.nodeTag(init_node) != .field_access) continue;
+
+        // buildStdTypePath answers empty when the chain does not start at
+        // `std` or one of its aliases.
+        const path = self.buildStdTypePath(tree, init_node);
+        if (path.len == 0) return null;
+
+        const dot = std.mem.findScalarLast(u8, path, '.');
+        const parent = if (dot) |i| path[0..i] else "";
+        const field_name = if (dot) |i| path[i + 1 ..] else path;
+        return self.findStdlibDecl(parent, field_name);
+    }
+    return null;
+}
+
 /// Finds a declaration node by name without following aliases.
 fn findDeclNodeByName(self: *TypeResolver, tree: *const Ast, name: []const u8, module_path: []const u8) ?MethodDef {
     _ = self;
@@ -1180,9 +1215,9 @@ fn resolveNumberLiteral(_: *TypeResolver, tree: *const Ast, node: Ast.Node.Index
     const main_token = tree.nodeMainToken(node);
     const text = tree.tokenSlice(main_token);
 
-    if (std.mem.indexOf(u8, text, ".") != null or
-        std.mem.indexOf(u8, text, "e") != null or
-        std.mem.indexOf(u8, text, "E") != null)
+    if (std.mem.find(u8, text, ".") != null or
+        std.mem.find(u8, text, "e") != null or
+        std.mem.find(u8, text, "E") != null)
     {
         return .{ .primitive = .comptime_float };
     }
@@ -2132,5 +2167,5 @@ test "findFnInCurrentModule: const alias to function" {
     const doc = doc_comments.getDocComment(std.testing.allocator, &mod.tree, method_def.?.node);
     defer if (doc) |d| std.testing.allocator.free(d);
     try std.testing.expect(doc != null);
-    try std.testing.expect(std.mem.indexOf(u8, doc.?, "Deprecated") != null);
+    try std.testing.expect(std.mem.find(u8, doc.?, "Deprecated") != null);
 }

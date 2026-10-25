@@ -97,7 +97,7 @@ pub const Rule = enum(u16) {
                 if (context.len > 0) try writer.print(": {s}", .{context});
             },
             .Z004 => {
-                const sep = std.mem.indexOfScalar(u8, context, 0) orelse context.len;
+                const sep = std.mem.findScalar(u8, context, 0) orelse context.len;
                 const name = context[0..sep];
                 const type_name = if (sep < context.len) context[sep + 1 ..] else "the explicit type";
                 try writer.print("prefer type annotation {s}'{s}'{s} with an anonymous initializer for {s}'{s}'{s}; preserve the declaration kind, modifiers, and fields", .{
@@ -111,7 +111,7 @@ pub const Rule = enum(u16) {
             // syntax highlight: .{...} over Type{...}
             // context is "preferred\x00original" format
             .Z010 => {
-                const sep = std.mem.indexOfScalar(u8, context, 0) orelse context.len;
+                const sep = std.mem.findScalar(u8, context, 0) orelse context.len;
                 const preferred = context[0..sep];
                 const original = if (sep < context.len) context[sep + 1 ..] else context;
                 try writer.print("prefer {s}`{s}", .{ d, r });
@@ -162,7 +162,7 @@ pub const Rule = enum(u16) {
             // file-struct @This() alias should match filename
             // context is "alias\x00expected" format
             .Z021 => {
-                const sep = std.mem.indexOfScalar(u8, context, 0) orelse context.len;
+                const sep = std.mem.findScalar(u8, context, 0) orelse context.len;
                 const alias = context[0..sep];
                 const expected = if (sep < context.len) context[sep + 1 ..] else context;
                 try writer.print("{s}@This(){s} alias {s}'{s}'{s} should match filename {s}'{s}'{s} or be {s}'Self'{s}", .{ b, r, y, alias, r, y, expected, r, y, r });
@@ -174,7 +174,7 @@ pub const Rule = enum(u16) {
             // argument order: type params, Allocator, Io, then other args
             // context is "current_kind\x00expected_before" format
             .Z023 => {
-                const sep = std.mem.indexOfScalar(u8, context, 0) orelse context.len;
+                const sep = std.mem.findScalar(u8, context, 0) orelse context.len;
                 const current = context[0..sep];
                 const before = if (sep < context.len) context[sep + 1 ..] else "";
                 try writer.print("{s}'{s}'{s} parameter should come before {s}'{s}'{s}", .{ y, current, r, y, before, r });
@@ -182,7 +182,7 @@ pub const Rule = enum(u16) {
             // line length exceeds limit
             // context is "actual_len\x00max_len" format
             .Z024 => {
-                const sep = std.mem.indexOfScalar(u8, context, 0) orelse context.len;
+                const sep = std.mem.findScalar(u8, context, 0) orelse context.len;
                 const actual = context[0..sep];
                 const max = if (sep < context.len) context[sep + 1 ..] else "120";
                 try writer.print("line exceeds {s}{s}{s} bytes ({s}{s}{s} bytes)", .{ y, max, r, y, actual, r });
@@ -204,7 +204,7 @@ pub const Rule = enum(u16) {
             // instance.decl -> Type.decl
             // context is "field_name\x00type_name"
             .Z027 => {
-                const sep = std.mem.indexOfScalar(u8, context, 0) orelse context.len;
+                const sep = std.mem.findScalar(u8, context, 0) orelse context.len;
                 const field = context[0..sep];
                 const type_name = if (sep < context.len) context[sep + 1 ..] else "";
                 try writer.print("access {s}'{s}'{s} through type {s}'{s}'{s} instead of instance", .{
@@ -220,7 +220,7 @@ pub const Rule = enum(u16) {
                 });
             },
             .Z030 => {
-                const sep = std.mem.indexOfScalar(u8, context, 0) orelse context.len;
+                const sep = std.mem.findScalar(u8, context, 0) orelse context.len;
                 const param_name = context[0..sep];
                 const reason = if (sep < context.len) context[sep + 1 ..] else "";
                 try writer.print("{s}deinit{s} should set {s}{s}.* = undefined{s}", .{ y, r, b, param_name, r });
@@ -233,7 +233,7 @@ pub const Rule = enum(u16) {
             },
             .Z032 => {
                 // context is "name\x00suggestion"
-                const sep = std.mem.indexOfScalar(u8, context, 0) orelse context.len;
+                const sep = std.mem.findScalar(u8, context, 0) orelse context.len;
                 const name = context[0..sep];
                 const suggestion = if (sep < context.len) context[sep + 1 ..] else "";
                 if (suggestion.len > 0) {
@@ -244,7 +244,7 @@ pub const Rule = enum(u16) {
             },
             .Z033 => {
                 // context is "name\x00word"
-                const sep = std.mem.indexOfScalar(u8, context, 0) orelse context.len;
+                const sep = std.mem.findScalar(u8, context, 0) orelse context.len;
                 const name = context[0..sep];
                 const word = if (sep < context.len) context[sep + 1 ..] else "";
                 try writer.print("type name {s}'{s}'{s} contains redundant word {s}'{s}'{s}", .{ y, name, r, y, word, r });

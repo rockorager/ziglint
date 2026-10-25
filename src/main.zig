@@ -236,9 +236,9 @@ fn detectZigLibPath(allocator: std.mem.Allocator, io: std.Io, writer: *std.Io.Wr
 
 fn parseLibDirFromZigEnv(allocator: std.mem.Allocator, output: []const u8) ?[]const u8 {
     const needle = ".lib_dir = \"";
-    const start_idx = std.mem.indexOf(u8, output, needle) orelse return null;
+    const start_idx = std.mem.find(u8, output, needle) orelse return null;
     const value_start = start_idx + needle.len;
-    const end_idx = std.mem.indexOfPos(u8, output, value_start, "\"") orelse return null;
+    const end_idx = std.mem.findPos(u8, output, value_start, "\"") orelse return null;
     return allocator.dupe(u8, output[value_start..end_idx]) catch null;
 }
 
@@ -390,7 +390,7 @@ fn matchesGitignore(path: []const u8, pattern: []const u8) bool {
         if (std.mem.eql(u8, component, clean_pattern)) return true;
     }
 
-    return std.mem.indexOf(u8, path, clean_pattern) != null;
+    return std.mem.find(u8, path, clean_pattern) != null;
 }
 
 fn loadGitignore(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) ?[]const u8 {
