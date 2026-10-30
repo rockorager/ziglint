@@ -36,6 +36,7 @@ pub const Rule = enum(u16) {
     Z032 = 32,
     Z033 = 33,
     Z034 = 34,
+    Z035 = 35,
 
     /// Returns the config struct type for this rule.
     /// All config types have `enabled: bool` (default varies per rule).
@@ -253,6 +254,13 @@ pub const Rule = enum(u16) {
             .Z034 => {
                 try writer.print("{s}print{s}{s}() has no format placeholders and empty args; use {s}writeAll{s}{s}() instead", .{ b, r, d, b, r, d });
             },
+            // context is "alias\x00qualified_path" format
+            .Z035 => {
+                const sep = std.mem.findScalar(u8, context, 0) orelse context.len;
+                const alias = context[0..sep];
+                const path = if (sep < context.len) context[sep + 1 ..] else "";
+                try writer.print("use alias {s}'{s}'{s} instead of {s}'{s}'{s}", .{ y, alias, r, y, path, r });
+            },
         }
     }
 };
@@ -435,6 +443,15 @@ test "Z030 uses the receiver name" {
         "deinit should set value.* = undefined (has early return before invalidation)",
         output.written(),
     );
+}
+
+test "Z035 names the alias and the qualified path" {
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    try Rule.Z035.writeMessage(&output.writer, "testing\x00std.testing", false);
+
+    try std.testing.expectEqualStrings("use alias 'testing' instead of 'std.testing'", output.written());
 }
 
 test "Z034 recommends writeAll for literal prints" {

@@ -194,6 +194,7 @@ pub fn lint(self: *Linter) void {
     const checks_start = if (timer) |t| timerRead(self.io.?, t) else 0;
     self.checkDeprecatedCalls();
     self.checkUnusedImports();
+    self.checkAliasUsage();
     self.checkThisBuiltin();
     self.checkInlineImports();
     self.checkCatchReturnAll();
@@ -319,6 +320,189 @@ fn checkUnusedImports(self: *Linter) void {
         if (!self.used_identifiers.contains(name)) {
             const loc = self.tree.tokenLocation(0, info.name_token);
             self.report(loc, .Z013, name);
+        }
+    }
+}
+
+const Alias = struct {
+    name: []const u8,
+    rhs_node: Ast.Node.Index,
+};
+
+/// Reports qualified paths that have a top-level alias, such as
+/// `std.testing.expect(...)` when `const testing = std.testing;` exists.
+/// The alias declaration itself is never reported; the qualified use is.
+fn checkAliasUsage(self: *Linter) void {
+    if (!self.config.isRuleEnabled(.Z035)) return;
+
+    var aliases: std.ArrayList(Alias) = .empty;
+    defer aliases.deinit(self.allocator);
+    self.collectAliases(&aliases);
+    if (aliases.items.len == 0) return;
+
+    for (0..self.tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @enumFromInt(i);
+        if (self.tree.nodeTag(node) != .field_access) continue;
+        if (!isIdentifierPath(&self.tree, node)) continue;
+
+        const alias = findMatchingAlias(&self.tree, aliases.items, node) orelse continue;
+        if (node == alias.rhs_node) continue;
+
+        // Tests often compare an alias to its source, e.g.
+        // `expectEqual(alias, path)`. Replacing the path there would make the
+        // comparison vacuous, so skip when the alias is another argument.
+        if (self.isAliasComparison(node, alias.name)) continue;
+
+        // A longer path can match a more specific alias. Report the outermost
+        // match so one expression does not produce two diagnostics.
+        if (self.parent_map[@intFromEnum(node)].unwrap()) |parent| {
+            if (self.tree.nodeTag(parent) == .field_access and
+                findMatchingAlias(&self.tree, aliases.items, parent) != null)
+            {
+                continue;
+            }
+        }
+
+        const root = identifierPathRoot(&self.tree, node);
+        const loc = self.tree.tokenLocation(0, self.tree.nodeMainToken(root));
+        const path = self.getNodeSource(node);
+        const context = std.fmt.allocPrint(self.allocator, "{s}\x00{s}", .{ alias.name, path }) catch continue;
+        self.trackContext(context);
+        self.report(loc, .Z035, context);
+    }
+}
+
+const TokenRange = struct {
+    first: Ast.TokenIndex,
+    last: Ast.TokenIndex,
+};
+
+/// Returns the token range holding a call's arguments, excluding the callee.
+fn callArgsRange(self: *Linter, call: Ast.Node.Index) ?TokenRange {
+    switch (self.tree.nodeTag(call)) {
+        .call_one, .call_one_comma => {
+            const data = self.tree.nodeData(call).node_and_opt_node;
+            const arg = data[1].unwrap() orelse return null;
+            return .{ .first = self.tree.firstToken(arg), .last = self.tree.lastToken(arg) };
+        },
+        .call, .call_comma => {
+            var buf: [1]Ast.Node.Index = undefined;
+            const full_call = self.tree.fullCall(&buf, call) orelse return null;
+            if (full_call.ast.params.len == 0) return null;
+            return .{
+                .first = self.tree.firstToken(full_call.ast.params[0]),
+                .last = self.tree.lastToken(full_call.ast.params[full_call.ast.params.len - 1]),
+            };
+        },
+        else => return null,
+    }
+}
+
+/// True when the candidate appears in a call argument or equality that also
+/// mentions the alias by name outside the candidate. Replacing the path then
+/// would make a test such as `expectEqual(alias, path)` compare the alias to
+/// itself.
+fn isAliasComparison(self: *Linter, candidate: Ast.Node.Index, alias_name: []const u8) bool {
+    const candidate_first = self.tree.firstToken(candidate);
+    const candidate_last = self.tree.lastToken(candidate);
+
+    for (0..self.tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @enumFromInt(i);
+        switch (self.tree.nodeTag(node)) {
+            .call_one, .call_one_comma, .call, .call_comma => {
+                const args = self.callArgsRange(node) orelse continue;
+                if (candidate_first < args.first or candidate_last > args.last) continue;
+                if (self.rangeMentionsAlias(args.first, args.last, candidate, alias_name)) return true;
+            },
+            .equal_equal, .bang_equal => {
+                const first = self.tree.firstToken(node);
+                const last = self.tree.lastToken(node);
+                if (candidate_first < first or candidate_last > last) continue;
+                if (self.rangeMentionsAlias(first, last, candidate, alias_name)) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn rangeMentionsAlias(self: *Linter, first: Ast.TokenIndex, last: Ast.TokenIndex, candidate: Ast.Node.Index, alias_name: []const u8) bool {
+    const candidate_first = self.tree.firstToken(candidate);
+    const candidate_last = self.tree.lastToken(candidate);
+
+    for (0..self.tree.nodes.len) |i| {
+        const node: Ast.Node.Index = @enumFromInt(i);
+        if (self.tree.nodeTag(node) != .identifier) continue;
+
+        const token = self.tree.nodeMainToken(node);
+        if (token < first or token > last) continue;
+        if (token >= candidate_first and token <= candidate_last) continue;
+        if (std.mem.eql(u8, self.tree.tokenSlice(token), alias_name)) return true;
+    }
+    return false;
+}
+
+fn collectAliases(self: *Linter, aliases: *std.ArrayList(Alias)) void {
+    for (self.tree.rootDecls()) |node| {
+        const var_decl = self.tree.fullVarDecl(node) orelse continue;
+        if (!std.mem.eql(u8, self.tree.tokenSlice(var_decl.ast.mut_token), "const")) continue;
+
+        const init_node = var_decl.ast.init_node.unwrap() orelse continue;
+        if (self.tree.nodeTag(init_node) != .field_access) continue;
+        if (!isIdentifierPath(&self.tree, init_node)) continue;
+
+        const name = self.tree.tokenSlice(var_decl.ast.mut_token + 1);
+        if (std.mem.eql(u8, name, "_")) continue;
+
+        aliases.append(self.allocator, .{ .name = name, .rhs_node = init_node }) catch return;
+    }
+}
+
+fn findMatchingAlias(tree: *const Ast, aliases: []const Alias, node: Ast.Node.Index) ?Alias {
+    for (aliases) |alias| {
+        if (pathsEqual(tree, node, alias.rhs_node)) return alias;
+    }
+    return null;
+}
+
+/// Compares two identifier paths by name, ignoring whitespace and comments.
+fn pathsEqual(tree: *const Ast, a: Ast.Node.Index, b: Ast.Node.Index) bool {
+    const a_tag = tree.nodeTag(a);
+    if (a_tag != tree.nodeTag(b)) return false;
+
+    return switch (a_tag) {
+        .identifier => std.mem.eql(
+            u8,
+            tree.tokenSlice(tree.nodeMainToken(a)),
+            tree.tokenSlice(tree.nodeMainToken(b)),
+        ),
+        .field_access => blk: {
+            const a_data = tree.nodeData(a).node_and_token;
+            const b_data = tree.nodeData(b).node_and_token;
+            if (!std.mem.eql(u8, tree.tokenSlice(a_data[1]), tree.tokenSlice(b_data[1]))) break :blk false;
+            break :blk pathsEqual(tree, a_data[0], b_data[0]);
+        },
+        else => false,
+    };
+}
+
+fn identifierPathRoot(tree: *const Ast, node: Ast.Node.Index) Ast.Node.Index {
+    var current = node;
+    while (tree.nodeTag(current) == .field_access) {
+        current = tree.nodeData(current).node_and_token[0];
+    }
+    return current;
+}
+
+/// Returns true when every node in the expression is an identifier or a field
+/// access on one, i.e. the expression names an existing declaration.
+fn isIdentifierPath(tree: *const Ast, node: Ast.Node.Index) bool {
+    var current = node;
+    while (true) {
+        switch (tree.nodeTag(current)) {
+            .identifier => return true,
+            .field_access => current = tree.nodeData(current).node_and_token[0],
+            else => return false,
         }
     }
 }
@@ -5790,6 +5974,216 @@ test "Z013: import used as identifier is ok" {
     for (linter.diagnostics.items) |d| {
         try std.testing.expect(d.rule != rules.Rule.Z013);
     }
+}
+
+test "Z035: flag qualified use when alias is used elsewhere" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const testing = std.testing;
+        \\
+        \\test "uses alias" {
+        \\    try testing.expect(true);
+        \\}
+        \\
+        \\test "uses long form" {
+        \\    try std.testing.expect(true);
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z035));
+    var found = false;
+    for (linter.diagnostics.items) |diag| {
+        if (diag.rule != .Z035) continue;
+        found = true;
+        try std.testing.expectEqual(9, diag.line);
+        try std.testing.expectEqualStrings("testing\x00std.testing", diag.context);
+    }
+    try std.testing.expect(found);
+}
+
+test "Z035: alias declaration is not reported" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const testing = std.testing;
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z035));
+}
+
+test "Z035: alias used by name is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const testing = std.testing;
+        \\
+        \\test "example" {
+        \\    try testing.expect(true);
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z035));
+}
+
+test "Z035: no alias means no diagnostic" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\
+        \\test "example" {
+        \\    try std.testing.expect(true);
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z035));
+}
+
+test "Z035: alias of a function is matched at full path" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const expect = std.testing.expect;
+        \\
+        \\test "example" {
+        \\    try std.testing.expect(true);
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z035));
+    try std.testing.expectEqualStrings("expect\x00std.testing.expect", linter.diagnostics.items[0].context);
+}
+
+test "Z035: nested aliases produce one diagnostic" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const testing = std.testing;
+        \\const expect = std.testing.expect;
+        \\
+        \\test "example" {
+        \\    try std.testing.expect(true);
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z035));
+    try std.testing.expectEqualStrings("expect\x00std.testing.expect", linter.diagnostics.items[0].context);
+}
+
+test "Z035: skip alias-vs-source comparisons in a call" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const Allocator = std.mem.Allocator;
+        \\
+        \\test "alias matches source" {
+        \\    try std.testing.expect(Allocator == std.mem.Allocator);
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z035));
+}
+
+test "Z035: skip alias-vs-source equality outside a call" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const Allocator = std.mem.Allocator;
+        \\const same = Allocator == std.mem.Allocator;
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z035));
+}
+
+test "Z035: skip comparisons nested inside an assertion call" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const testing = std.testing;
+        \\
+        \\test "alias matches source" {
+        \\    compare(@tagName(std.testing), @tagName(testing));
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z035));
+}
+
+test "Z035: mixed use in a call is still reported" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const testing = std.testing;
+        \\
+        \\fn example() void {
+        \\    consume(std.testing.expect);
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z035));
+}
+
+test "Z035: mixed use in a declaration is still reported" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const testing = std.testing;
+        \\
+        \\fn example() void {
+        \\    var failing: std.testing.FailingAllocator = .init(testing.allocator, .{});
+        \\    _ = failing;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z035));
+}
+
+test "Z035: namespace alias in a type position" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\const mem = std.mem;
+        \\
+        \\fn clone(allocator: std.mem.Allocator) void {
+        \\    _ = allocator;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z035));
+    try std.testing.expectEqualStrings("mem\x00std.mem", linter.diagnostics.items[0].context);
+}
+
+test "Z035: pub alias is still usable" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\pub const testing = std.testing;
+        \\
+        \\test "example" {
+        \\    try std.testing.expect(true);
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z035));
+}
+
+test "Z035: local aliases are not tracked" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\
+        \\test "example" {
+        \\    const testing = std.testing;
+        \\    try testing.expect(true);
+        \\    try std.testing.expect(true);
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z035));
 }
 
 test "Z014: detect snake_case error set" {

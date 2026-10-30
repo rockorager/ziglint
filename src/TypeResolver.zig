@@ -1195,7 +1195,7 @@ fn findFnInType(self: *TypeResolver, tree: *const Ast, type_name: []const u8, fn
     return null;
 }
 
-fn resolveReturnType(self: *TypeResolver, tree: *const Ast, fn_proto: std.zig.Ast.full.FnProto, module_path: []const u8) TypeInfo {
+fn resolveReturnType(self: *TypeResolver, tree: *const Ast, fn_proto: Ast.full.FnProto, module_path: []const u8) TypeInfo {
     const ret_node = fn_proto.ast.return_type.unwrap() orelse return .unknown;
     return self.resolveNodeType(tree, ret_node, module_path);
 }
