@@ -5206,6 +5206,63 @@ test "Z011: detect deprecated stdlib function alias" {
     try std.testing.expectEqual(1, linter.diagnosticCount(.Z011));
 }
 
+test "Z011: detect deprecated method on a stdlib type declared in an imported module" {
+    // `std.zig.Color` is declared inside zig.zig, which the resolver reaches by
+    // following an import from std.zig. The method's definition must name
+    // zig.zig through memory the module graph owns: the resolver frees its
+    // copy of that path when the lookup returns, and the arena reuses those
+    // bytes, so the release binary looked the definition up in the wrong
+    // module and read past its node array.
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.createDirPath(std.testing.io, "lib/std");
+    try tmp_dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "lib/std/std.zig",
+        .data =
+        \\pub const zig = @import("zig.zig");
+        ,
+    });
+    try tmp_dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "lib/std/zig.zig",
+        .data =
+        \\pub const Color = enum {
+        \\    auto,
+        \\
+        \\    /// Deprecated: use fromEnvironment instead
+        \\    pub fn get() Color {
+        \\        return .auto;
+        \\    }
+        \\};
+        ,
+    });
+
+    const source =
+        \\const std = @import("std");
+        \\pub fn main() void {
+        \\    _ = std.zig.Color.get();
+        \\}
+    ;
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    const zig_lib_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "lib", std.testing.allocator);
+    defer std.testing.allocator.free(zig_lib_path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, zig_lib_path);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    var linter: Linter = .initWithSemantics(std.testing.allocator, source, path, &resolver, path, null);
+    defer linter.deinit();
+    linter.lint();
+
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z011));
+}
+
 test "Z011: detect deprecated type function in type positions" {
     // The recursive visitor stops at function signatures, container fields,
     // and type wrappers. The rule must still report calls in those positions,
