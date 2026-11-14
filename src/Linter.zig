@@ -710,6 +710,40 @@ fn getNodeChildren(self: *Linter, node: Ast.Node.Index) ChildList {
             children.append(data[1]); // The catch body
         },
 
+        // Binary operators: node_and_node = [lhs, rhs]. Leaving these out
+        // broke the parent chain, and with it every walk from a use site to
+        // its enclosing function: `b.lazyDependency(...) orelse return` lost
+        // the receiver, so the deprecation check had nothing to resolve.
+        .@"orelse",
+        .bool_and,
+        .bool_or,
+        .bit_and,
+        .bit_xor,
+        .bit_or,
+        .div,
+        .mod,
+        .array_mult,
+        .mul_wrap,
+        .mul_sat,
+        .add,
+        .sub,
+        .add_wrap,
+        .sub_wrap,
+        .add_sat,
+        .sub_sat,
+        .shl,
+        .shl_sat,
+        .shr,
+        .array_cat,
+        .slice_open,
+        .array_access,
+        .error_union,
+        => {
+            const data = self.tree.nodeData(node).node_and_node;
+            children.append(data[0]);
+            children.append(data[1]);
+        },
+
         else => {},
     }
 
@@ -5475,6 +5509,40 @@ test "Z011: detect deprecated method on pointer-typed const" {
         \\};
         \\const instance: *Foo = undefined;
         \\pub fn main() void { instance.oldMethod(); }
+    ));
+}
+
+test "Z011: detect deprecated method behind orelse" {
+    // The parent map had no edge for `orelse`, so the receiver could not walk
+    // to its enclosing function and `const x = f.old() orelse return;` went
+    // unreported. build.zig's `b.lazyDependency(...) orelse return` is this.
+    try std.testing.expectEqual(1, try lintWithSemantics(.Z011,
+        \\const Foo = struct {
+        \\    /// Deprecated: use newMethod instead
+        \\    pub fn oldMethod(self: *Foo) ?*Foo {
+        \\        _ = self;
+        \\        return null;
+        \\    }
+        \\};
+        \\fn useIt(f: *Foo) void {
+        \\    const x = f.oldMethod() orelse return;
+        \\    _ = x;
+        \\}
+    ));
+}
+
+test "Z011: detect deprecated method behind a binary operator" {
+    try std.testing.expectEqual(1, try lintWithSemantics(.Z011,
+        \\const Foo = struct {
+        \\    /// Deprecated: use newMethod instead
+        \\    pub fn check(self: *Foo) bool {
+        \\        _ = self;
+        \\        return true;
+        \\    }
+        \\};
+        \\fn useIt(f: *Foo, cond: bool) void {
+        \\    _ = cond and f.check();
+        \\}
     ));
 }
 
