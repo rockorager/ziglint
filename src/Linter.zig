@@ -1130,6 +1130,12 @@ fn buildPublicTypesMap(self: *Linter) void {
 fn isImportedType(self: *Linter, var_decl: Ast.full.VarDecl) bool {
     const init_node = var_decl.ast.init_node.unwrap() orelse return false;
 
+    // `Outer.Inner` rooted at a container declared in this file is a local
+    // type, not an import. The resolver reports the path as a std_type and
+    // the syntactic fallback sees a PascalCase field, so without this every
+    // nested local type read as imported.
+    if (self.fieldAccessRootsAtLocalContainer(init_node)) return false;
+
     // Use type resolver if available. Unresolved is not a negative answer:
     // the module graph resolves only std, builtin, and relative .zig
     // imports, so build-declared module names (@import("runtime")) and
@@ -1139,7 +1145,14 @@ fn isImportedType(self: *Linter, var_decl: Ast.full.VarDecl) bool {
         if (self.module_path) |mod_path| {
             const type_info = resolver.typeOf(mod_path, init_node);
             switch (type_info) {
-                .type_type, .std_type, .user_type => return true,
+                .type_type, .std_type => return true,
+                // A user type is only an import when it lives in another
+                // module. A local container decl resolves to a user_type
+                // whose module_path is this file; calling that an import hid
+                // every local alias to a private type from Z012.
+                .user_type => |user| {
+                    if (!std.mem.eql(u8, user.module_path, mod_path)) return true;
+                },
                 else => {},
             }
         }
@@ -1246,25 +1259,157 @@ fn isTypeExpression(self: *Linter, node: Ast.Node.Index) bool {
 }
 
 fn isPrivateTypeRef(self: *Linter, name: []const u8, enclosing_container: Ast.Node.OptionalIndex) bool {
-    if (!isPascalCase(name)) return false;
-    if (isBuiltinType(name)) return false;
-    if (self.public_types.contains(name)) return false;
-    if (self.imported_types.contains(name)) return false;
+    if (self.isCallerNameableType(name, enclosing_container)) return false;
+    // Zig aliases are transparent, so an alias that reduces to something the
+    // caller can spell without the alias exposes no private type, whatever
+    // its `pub` status: `const Code = u40` gives them nothing `u40` does not.
+    return !self.aliasesCallerSpellable(name, enclosing_container, 0);
+}
+
+/// True when an outside caller can name this type without the alias in the
+/// signature: it is a primitive, it is declared `pub` where it lives, or it
+/// comes from another module.
+fn isCallerNameableType(self: *Linter, name: []const u8, enclosing_container: Ast.Node.OptionalIndex) bool {
+    if (!isPascalCase(name)) return true;
+    if (isBuiltinType(name)) return true;
+    if (self.public_types.contains(name)) return true;
+    if (self.imported_types.contains(name)) return true;
     // Don't flag Self type (type matching filename for file-as-struct pattern)
-    if (self.isSelfType(name)) return false;
+    if (self.isSelfType(name)) return true;
     // A type pub in any enclosing container is nameable alongside this
     // function, and so is an enclosing container itself: self-referencing
     // methods like `fn send(self: *Connection)` are not private exposures.
     var container_opt = enclosing_container;
     while (container_opt.unwrap()) |container| {
         if (self.containerOwnName(container)) |own| {
-            if (std.mem.eql(u8, own, name)) return false;
+            if (std.mem.eql(u8, own, name)) return true;
         }
-        if (self.isThisAliasInContainer(name, container)) return false;
-        if (self.isPublicInContainer(name, container.toOptional())) return false;
+        if (self.isThisAliasInContainer(name, container)) return true;
+        if (self.isPublicInContainer(name, container.toOptional())) return true;
         container_opt = self.findEnclosingContainer(container);
     }
-    return true;
+    return false;
+}
+
+/// True when `name` resolves to a declaration whose initializer is spelled
+/// only with types an outside caller can name, directly or through other
+/// aliases.
+fn aliasesCallerSpellable(
+    self: *Linter,
+    name: []const u8,
+    enclosing_container: Ast.Node.OptionalIndex,
+    depth: usize,
+) bool {
+    if (self.isCallerNameableType(name, enclosing_container)) return true;
+    // Alias chains are shallow; the cap stops a self-referential file from
+    // spinning the linter on a cycle that the compiler would reject anyway.
+    if (depth > 8) return false;
+    const init_node = self.findTypeAliasInit(name, enclosing_container) orelse return false;
+    return self.typeExprIsCallerSpellable(init_node, enclosing_container, depth + 1);
+}
+
+fn typeExprIsCallerSpellable(
+    self: *Linter,
+    node: Ast.Node.Index,
+    enclosing_container: Ast.Node.OptionalIndex,
+    depth: usize,
+) bool {
+    if (depth > 8) return false;
+    switch (self.tree.nodeTag(node)) {
+        .identifier => {
+            const name = self.tree.tokenSlice(self.tree.nodeMainToken(node));
+            return self.aliasesCallerSpellable(name, enclosing_container, depth + 1);
+        },
+        .optional_type => {
+            const child = self.tree.nodeData(node).node;
+            return self.typeExprIsCallerSpellable(child, enclosing_container, depth + 1);
+        },
+        .ptr_type_aligned, .ptr_type_sentinel, .ptr_type, .ptr_type_bit_range => {
+            const ptr = self.tree.fullPtrType(node) orelse return false;
+            return self.typeExprIsCallerSpellable(ptr.ast.child_type, enclosing_container, depth + 1);
+        },
+        .array_type, .array_type_sentinel => {
+            const arr = self.tree.fullArrayType(node) orelse return false;
+            return self.typeExprIsCallerSpellable(arr.ast.elem_type, enclosing_container, depth + 1);
+        },
+        // `Outer.Inner` is spellable when both halves are; unknown paths
+        // (import roots, calls) are not evidence either way, and the import
+        // check has already had its say on those.
+        .field_access => return self.fieldAccessIsCallerSpellable(node, enclosing_container, depth) orelse false,
+        // A container literal is not spellable from outside, and an arbitrary
+        // expression (`SomeFn()`, `@TypeOf(x)`) is not either.
+        else => return false,
+    }
+}
+
+/// Whether an outside caller can spell the field access `base.field`. Null
+/// means the path does not resolve to a container declared in this file, so
+/// the access is neither provably private nor provably nameable.
+fn fieldAccessIsCallerSpellable(
+    self: *Linter,
+    node: Ast.Node.Index,
+    enclosing_container: Ast.Node.OptionalIndex,
+    depth: usize,
+) ?bool {
+    const container = self.fieldAccessContainer(node, enclosing_container) orelse return null;
+    const data = self.tree.nodeData(node).node_and_token;
+    const base_name = self.tree.tokenSlice(self.tree.nodeMainToken(data[0]));
+    const field_name = self.tree.tokenSlice(data[1]);
+    if (!self.aliasesCallerSpellable(base_name, enclosing_container, depth + 1)) return false;
+    return self.isPublicInContainer(field_name, container.toOptional());
+}
+
+/// The container declaration a field access path points into, when its root
+/// is an identifier naming a container declared in this file.
+fn fieldAccessContainer(
+    self: *Linter,
+    node: Ast.Node.Index,
+    enclosing_container: Ast.Node.OptionalIndex,
+) ?Ast.Node.Index {
+    if (self.tree.nodeTag(node) != .field_access) return null;
+    const base = self.tree.nodeData(node).node_and_token[0];
+    if (self.tree.nodeTag(base) != .identifier) return null;
+    const base_name = self.tree.tokenSlice(self.tree.nodeMainToken(base));
+    const init_node = self.findTypeAliasInit(base_name, enclosing_container) orelse return null;
+    var members_buf: [2]Ast.Node.Index = undefined;
+    if (self.getContainerMembers(init_node, &members_buf) == null) return null;
+    return init_node;
+}
+
+/// True when a type alias initializer is a field access path (`Outer.Inner`)
+/// rooted at a container declared in this file.
+fn fieldAccessRootsAtLocalContainer(self: *Linter, init_node: Ast.Node.Index) bool {
+    if (self.tree.nodeTag(init_node) != .field_access) return false;
+    const base = self.tree.nodeData(init_node).node_and_token[0];
+    if (self.tree.nodeTag(base) != .identifier) return false;
+    const base_name = self.tree.tokenSlice(self.tree.nodeMainToken(base));
+    const var_decl = self.findTopLevelVarDecl(base_name) orelse return false;
+    const root_init = var_decl.ast.init_node.unwrap() orelse return false;
+    var members_buf: [2]Ast.Node.Index = undefined;
+    return self.getContainerMembers(root_init, &members_buf) != null;
+}
+
+/// Initializer of the declaration named `name`, searching enclosing containers
+/// from the innermost outward, then the file root.
+fn findTypeAliasInit(
+    self: *Linter,
+    name: []const u8,
+    enclosing_container: Ast.Node.OptionalIndex,
+) ?Ast.Node.Index {
+    var container_opt = enclosing_container;
+    while (container_opt.unwrap()) |container| {
+        var members_buf: [2]Ast.Node.Index = undefined;
+        if (self.getContainerMembers(container, &members_buf)) |members| {
+            for (members) |member| {
+                const var_decl = self.tree.fullVarDecl(member) orelse continue;
+                if (!std.mem.eql(u8, self.tree.tokenSlice(var_decl.ast.mut_token + 1), name)) continue;
+                return var_decl.ast.init_node.unwrap();
+            }
+        }
+        container_opt = self.findEnclosingContainer(container);
+    }
+    const var_decl = self.findTopLevelVarDecl(name) orelse return null;
+    return var_decl.ast.init_node.unwrap();
 }
 
 /// True when `name` is declared in `container` as `const name = @This()` —
@@ -1352,18 +1497,36 @@ fn isSelfType(self: *Linter, name: []const u8) bool {
     return std.mem.eql(u8, name, stem);
 }
 
+/// True for Zig primitives: the numbered types, the C ABI aliases, and the
+/// special types (`type`, `anyerror`, `anyopaque`, ...).
 fn isBuiltinType(name: []const u8) bool {
     const builtins = [_][]const u8{
-        "u8",           "u16",            "u32",  "u64",      "u128",    "usize",
-        "i8",           "i16",            "i32",  "i64",      "i128",    "isize",
-        "f16",          "f32",            "f64",  "f80",      "f128",    "bool",
-        "void",         "noreturn",       "type", "anyerror", "anytype", "anyframe",
-        "comptime_int", "comptime_float",
+        "u8",           "u16",          "u32",            "u64",      "u128",       "usize",
+        "i8",           "i16",          "i32",            "i64",      "i128",       "isize",
+        "f16",          "f32",          "f64",            "f80",      "f128",       "bool",
+        "void",         "noreturn",     "type",           "anyerror", "anytype",    "anyframe",
+        "anyopaque",    "comptime_int", "comptime_float", "c_char",   "c_short",    "c_ushort",
+        "c_int",        "c_uint",       "c_long",         "c_ulong",  "c_longlong", "c_ulonglong",
+        "c_longdouble", "c_void",
     };
     for (builtins) |b| {
         if (std.mem.eql(u8, name, b)) return true;
     }
-    return false;
+    // Zig integers take any width, so the table above only covers the widths
+    // that happen to be common. `u40` (a packed five-byte code, say) is just
+    // as much a primitive as `u64`.
+    return isArbitraryWidthInt(name);
+}
+
+/// True for `u`/`i` followed by one or more digits, the spelling Zig uses for
+/// arbitrary-width integers.
+fn isArbitraryWidthInt(name: []const u8) bool {
+    if (name.len < 2) return false;
+    if (name[0] != 'u' and name[0] != 'i') return false;
+    for (name[1..]) |c| {
+        if (!std.ascii.isDigit(c)) return false;
+    }
+    return true;
 }
 
 const ParamKind = enum {
@@ -1697,6 +1860,14 @@ fn checkTypeNodeForPrivateImpl(
         .array_type, .array_type_sentinel => {
             if (self.tree.fullArrayType(type_node)) |arr| {
                 self.checkTypeNodeForPrivateImpl(arr.ast.elem_type, fn_proto, generic_params, is_error_position, enclosing_container);
+            }
+        },
+        // Qualified paths into a local container (`Outer.Inner`). Paths into
+        // imports are left alone: their names arrive through imported_types.
+        .field_access => {
+            if (self.fieldAccessIsCallerSpellable(type_node, enclosing_container, 0) == false) {
+                const field_token = self.tree.nodeData(type_node).node_and_token[1];
+                self.reportPrivateType(fn_proto, self.tree.tokenSlice(field_token), is_error_position);
             }
         },
         else => {},
@@ -3085,17 +3256,20 @@ fn checkDeprecatedCall(self: *Linter, node: Ast.Node.Index) void {
         name_token = data[1];
         fn_name = self.tree.tokenSlice(name_token);
 
-        const receiver_type = resolver.typeOf(mod_path, receiver_node);
-        method_def = resolver.findMethodDef(receiver_type, fn_name);
+        const receiver_type = self.receiverType(receiver_node);
+        if (receiver_type) |typ| {
+            method_def = resolver.findMethodDef(typ, fn_name);
 
-        // For stdlib types, also get the declaration without following aliases
-        // (the alias itself may be deprecated, like std.ArrayListUnmanaged)
-        switch (receiver_type) {
-            .std_type => |s| {
-                stdlib_path = s.path;
-                stdlib_decl = resolver.findStdlibDecl(s.path, fn_name);
-            },
-            else => {},
+            // For stdlib types, also get the declaration without following
+            // aliases (the alias itself may be deprecated, like
+            // std.ArrayListUnmanaged)
+            switch (unwrapPointerTypeInfo(typ)) {
+                .std_type => |s| {
+                    stdlib_path = s.path;
+                    stdlib_decl = resolver.findStdlibDecl(s.path, fn_name);
+                },
+                else => {},
+            }
         }
     } else if (fn_expr_tag == .identifier) {
         // Direct function call in the same module (e.g., `DeprecatedFunc()`)
@@ -3128,6 +3302,46 @@ fn checkDeprecatedCall(self: *Linter, node: Ast.Node.Index) void {
     // function, as with `std.fs.path`.
     if (stdlib_path) |path| {
         self.checkStdlibNamespaceDeprecation(path, name_token);
+    }
+}
+
+/// Type of a method-call receiver. The resolver answers module-level names
+/// and imports; a parameter receiver needs the enclosing function, which only
+/// the linter maps. `b.lazyDependency(...)` in a build.zig has a parameter
+/// receiver (`b: *std.Build`) and resolved to unknown before.
+///
+/// Parameters only: walking block scopes for typed locals cost 30s on the Zig
+/// tree for a case that is rare next to `self` and build.zig's `b`.
+fn receiverType(self: *Linter, receiver_node: Ast.Node.Index) ?TypeResolver.TypeInfo {
+    const resolver = self.type_resolver orelse return null;
+    const mod_path = self.module_path orelse return null;
+
+    const type_info = resolver.typeOf(mod_path, receiver_node);
+    if (type_info != .unknown) return type_info;
+    if (self.tree.nodeTag(receiver_node) != .identifier) return null;
+
+    const name = self.tree.tokenSlice(self.tree.nodeMainToken(receiver_node));
+    var current = receiver_node;
+    while (true) {
+        const parent = self.parent_map[@intFromEnum(current)].unwrap() orelse return null;
+        if (self.tree.nodeTag(parent) == .fn_decl) {
+            const type_node = self.findParamTypeNode(parent, name) orelse return null;
+            return resolver.typeOf(mod_path, type_node);
+        }
+        current = parent;
+    }
+}
+
+/// Method lookup treats pointers and optionals as transparent: `self: *Foo`
+/// dispatches to `Foo`'s methods.
+fn unwrapPointerTypeInfo(type_info: TypeResolver.TypeInfo) TypeResolver.TypeInfo {
+    var current = type_info;
+    while (true) {
+        current = switch (current) {
+            .pointer => |p| (p.child orelse return current).*,
+            .optional => |o| (o.child orelse return current).*,
+            else => return current,
+        };
     }
 }
 
@@ -3171,7 +3385,7 @@ fn checkDefDeprecation(self: *Linter, def: TypeResolver.MethodDef, name_token: A
         defer self.allocator.free(doc);
 
         const loc = self.tree.tokenLocation(0, name_token);
-        const msg = std.fmt.allocPrint(self.allocator, "'{s}' is deprecated: {s}", .{ display_name, doc }) catch return false;
+        const msg = std.fmt.allocPrint(self.allocator, "'{s}' is deprecated: {s}", .{ display_name, deprecationSummary(doc) }) catch return false;
         self.allocated_contexts.append(self.allocator, msg) catch {
             self.allocator.free(msg);
             return false;
@@ -3195,7 +3409,7 @@ fn checkDefDeprecation(self: *Linter, def: TypeResolver.MethodDef, name_token: A
         self.deprecation_cache.put(self.allocator, cache_key, true) catch return true;
 
         const loc = self.tree.tokenLocation(0, name_token);
-        const msg = std.fmt.allocPrint(self.allocator, "'{s}' is deprecated: {s}", .{ display_name, doc }) catch return false;
+        const msg = std.fmt.allocPrint(self.allocator, "'{s}' is deprecated: {s}", .{ display_name, deprecationSummary(doc) }) catch return false;
         self.allocated_contexts.append(self.allocator, msg) catch {
             self.allocator.free(msg);
             return false;
@@ -3213,14 +3427,33 @@ fn containsDeprecated(text: []const u8) bool {
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |raw_line| {
         const line = std.mem.trim(u8, raw_line, " \t\r");
-        if (std.ascii.startsWithIgnoreCase(line, "deprecated")) {
-            if (line.len == "deprecated".len) return true;
-            const separator = line["deprecated".len];
-            if (separator == ':' or separator == ';' or separator == ',' or separator == '.' or separator == ' ') return true;
-        }
-        if (std.ascii.startsWithIgnoreCase(line, "this function is deprecated")) return true;
+        if (isDeprecationLine(line)) return true;
     }
     return false;
+}
+
+/// Whether a doc comment line announces the deprecation.
+fn isDeprecationLine(line: []const u8) bool {
+    if (std.ascii.startsWithIgnoreCase(line, "deprecated")) {
+        if (line.len == "deprecated".len) return true;
+        const separator = line["deprecated".len];
+        if (separator == ':' or separator == ';' or separator == ',' or separator == '.' or separator == ' ') return true;
+    }
+    return std.ascii.startsWithIgnoreCase(line, "this function is deprecated");
+}
+
+/// The deprecation line of a doc comment, for the diagnostic message. A
+/// comment can run to several lines (`std.mem.Allocator.dupeZ` continues with
+/// a description) and a diagnostic is one line.
+fn deprecationSummary(doc: []const u8) []const u8 {
+    var lines = std.mem.splitScalar(u8, doc, '\n');
+    var first: ?[]const u8 = null;
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (isDeprecationLine(line)) return line;
+        if (first == null and line.len != 0) first = line;
+    }
+    return first orelse doc;
 }
 
 fn checkCompoundAssert(self: *Linter, node: Ast.Node.Index) void {
@@ -3843,10 +4076,23 @@ fn trackContext(self: *Linter, context: []const u8) void {
 fn report(self: *Linter, loc: Ast.Location, rule: rules.Rule, context: []const u8) void {
     if (self.isIgnored(loc.line, rule)) return;
 
+    const line: u32 = @intCast(loc.line + 1);
+    const column: u32 = @intCast(loc.column + 1);
+
+    // One diagnostic per rule, site, and subject. A signature that names the
+    // same private type twice (`a: Hidden, b: Hidden`) reported the function
+    // twice, which reads as two separate findings at one location.
+    for (self.diagnostics.items) |existing| {
+        if (existing.rule == rule and
+            existing.line == line and
+            existing.column == column and
+            std.mem.eql(u8, existing.context, context)) return;
+    }
+
     self.diagnostics.append(self.allocator, .{
         .path = self.path,
-        .line = @intCast(loc.line + 1),
-        .column = @intCast(loc.column + 1),
+        .line = line,
+        .column = column,
         .rule = rule,
         .context = context,
         // ziglint-ignore: Z026 -- on OOM the diagnostic is dropped, not the pass
@@ -5156,6 +5402,82 @@ test "Z011: detect deprecated stdlib namespace" {
     try std.testing.expectEqual(1, linter.diagnosticCount(.Z011));
 }
 
+test "Z011: detect deprecated method on a parameter receiver" {
+    // `b.lazyDependency(...)` in a build.zig: the receiver is a parameter
+    // (`b: *std.Build`), which the resolver does not answer from the module
+    // scope. The linter maps it through the enclosing function.
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.createDirPath(std.testing.io, "lib/std");
+    try tmp_dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "lib/std/std.zig",
+        .data =
+        \\pub const Build = @import("Build.zig");
+        ,
+    });
+    try tmp_dir.dir.writeFile(std.testing.io, .{
+        .sub_path = "lib/std/Build.zig",
+        .data =
+        \\pub const Build = @This();
+        \\
+        \\/// Deprecated in favor of `dependencyLazy`.
+        \\pub fn lazyDependency(b: *Build, name: []const u8) void {
+        \\    _ = b;
+        \\    _ = name;
+        \\}
+        ,
+    });
+
+    const source =
+        \\const std = @import("std");
+        \\pub fn build(b: *std.Build) void {
+        \\    b.lazyDependency("tls", .{});
+        \\}
+    ;
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    const zig_lib_path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "lib", std.testing.allocator);
+    defer std.testing.allocator.free(zig_lib_path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, zig_lib_path);
+    defer graph.deinit();
+
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    var linter: Linter = .initWithSemantics(std.testing.allocator, source, path, &resolver, path, null);
+    defer linter.deinit();
+    linter.lint();
+
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z011));
+}
+
+test "Z011: detect deprecated method through a pointer receiver" {
+    // `self: *Foo` is the usual receiver shape; the pointee has to be
+    // resolved or method lookup sees a pointer with nothing inside.
+    try std.testing.expectEqual(1, try lintWithSemantics(.Z011,
+        \\const Foo = struct {
+        \\    /// Deprecated: use newMethod instead
+        \\    pub fn oldMethod(self: *Foo) void { _ = self; }
+        \\};
+        \\fn useIt(f: *Foo) void { f.oldMethod(); }
+    ));
+}
+
+test "Z011: detect deprecated method on pointer-typed const" {
+    try std.testing.expectEqual(1, try lintWithSemantics(.Z011,
+        \\const Foo = struct {
+        \\    /// Deprecated: use newMethod instead
+        \\    pub fn oldMethod(self: *Foo) void { _ = self; }
+        \\};
+        \\const instance: *Foo = undefined;
+        \\pub fn main() void { instance.oldMethod(); }
+    ));
+}
+
 test "Z011: detect deprecated stdlib function alias" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
@@ -5540,6 +5862,16 @@ test "Z011: deprecated stdlib corpus - real Zig 0.15.2 deprecations" {
     }
 }
 
+test "deprecationSummary keeps a diagnostic to one line" {
+    // `std.mem.Allocator.dupeZ` carries a second line of description; the
+    // message must not spill onto the next output line.
+    const doc = "Deprecated in favor of `dupeSentinel`\nCopies `m` to newly allocated memory.";
+    try std.testing.expectEqualStrings("Deprecated in favor of `dupeSentinel`", deprecationSummary(doc));
+    // The announcement is not always the first line.
+    try std.testing.expectEqualStrings("Deprecated in favor of X", deprecationSummary("Summary\nDeprecated in favor of X\nMore."));
+    try std.testing.expectEqualStrings("Plain summary", deprecationSummary("Plain summary"));
+}
+
 test "containsDeprecated" {
     try std.testing.expect(containsDeprecated("Deprecated: use X instead"));
     try std.testing.expect(containsDeprecated("deprecated; use X instead"));
@@ -5723,7 +6055,9 @@ test "Z012: pub fn in nested container using outer non-pub type is error" {
     , "test.zig", null);
     defer linter.deinit();
     linter.lint();
-    try std.testing.expectEqual(2, linter.diagnosticCount(.Z012));
+    // One diagnostic: the return and the parameter name the same type at the
+    // same site, and reporting both reads as two separate findings.
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z012));
 }
 
 test "Z012: pub fn exposing private type through pointer is error" {
@@ -5854,6 +6188,254 @@ test "Z012: pub fn returning builtin type is ok" {
     for (linter.diagnostics.items) |d| {
         try std.testing.expect(d.rule != rules.Rule.Z012);
     }
+}
+
+test "Z012: pub fn returning pub alias of arbitrary-width int is ok" {
+    // Zig integers take any width; `u40` is a primitive, so `Code` is a type
+    // decl, not a private type the caller cannot name.
+    var linter: Linter = .init(std.testing.allocator,
+        \\pub const Code = u40;
+        \\pub const Wire = [5]u8;
+        \\pub fn pack(code: *const Wire) Code {
+        \\    var value: u40 = 0;
+        \\    for (code) |byte| value = (value << 8) | byte;
+        \\    return value;
+        \\}
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z012));
+}
+
+test "Z012: private alias of primitive is ok" {
+    // Aliases are transparent: callers write `u7` and `f64` directly, so a
+    // non-pub alias exposes nothing private.
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Code = u40;
+        \\const Wid = u7;
+        \\const Real = f64;
+        \\pub fn code() Code { return 0; }
+        \\pub fn width() Wid { return 1; }
+        \\pub fn scale() Real { return 1; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z012));
+}
+
+test "Z012: private alias wrapping a primitive is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Bytes = []const u8;
+        \\const MaybeCode = ?u40;
+        \\const Wire = *const [5]u8;
+        \\pub fn read(b: Bytes) MaybeCode { _ = b; return 0; }
+        \\pub fn wire() Wire { return undefined; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z012));
+}
+
+test "Z012: private alias of alias of primitive is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Code = u40;
+        \\const Short = Code;
+        \\pub fn code() Short { return 0; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z012));
+}
+
+test "Z012: alias inside struct to primitive is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\pub const Proto = struct {
+        \\    const Wire = [5]u8;
+        \\    const Code = u40;
+        \\    pub fn pack(code: *const Wire) Code {
+        \\        _ = code;
+        \\        return 0;
+        \\    }
+        \\};
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z012));
+}
+
+test "Z012: private alias wrapping a private type is error" {
+    // The wrapper is builtin-shaped, but the element type is not nameable by
+    // callers, so the exposure is still real.
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Hidden = struct {};
+        \\const Wrapped = [2]Hidden;
+        \\pub fn getWrapped() Wrapped { return undefined; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z012));
+}
+
+test "isArbitraryWidthInt recognises Zig integer spellings" {
+    try std.testing.expect(isArbitraryWidthInt("u1"));
+    try std.testing.expect(isArbitraryWidthInt("u40"));
+    try std.testing.expect(isArbitraryWidthInt("i127"));
+    try std.testing.expect(!isArbitraryWidthInt("u"));
+    try std.testing.expect(!isArbitraryWidthInt("usize"));
+    try std.testing.expect(!isArbitraryWidthInt("u8x"));
+    try std.testing.expect(!isArbitraryWidthInt("f64"));
+}
+
+/// Lint `source` as `test.zig` with a module graph behind it, matching what
+/// the CLI does. The semantic path answers differently from the syntactic
+/// fallback for local aliases, so Z012 needs coverage on both.
+fn lintWithSemantics(rule: rules.Rule, source: [:0]const u8) !usize {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.zig", .data = source });
+    const path = try tmp_dir.dir.realPathFileAlloc(std.testing.io, "test.zig", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+
+    var graph = try ModuleGraph.init(std.testing.allocator, std.testing.io, path, null);
+    defer graph.deinit();
+    var resolver: TypeResolver = .init(std.testing.allocator, &graph);
+    defer resolver.deinit();
+
+    var linter: Linter = .initWithSemantics(std.testing.allocator, source, path, &resolver, path, null);
+    defer linter.deinit();
+    linter.lint();
+    return linter.diagnosticCount(rule);
+}
+
+test "Z012: local alias of private type is flagged with semantics" {
+    // The resolver answers `user_type` with this module's own path for a local
+    // container decl. Reading that as an import excused every such alias.
+    try std.testing.expectEqual(1, try lintWithSemantics(.Z012,
+        \\const Hidden = struct {};
+        \\const Alias = Hidden;
+        \\pub fn getAlias() Alias { return .{}; }
+    ));
+}
+
+test "Z012: local alias of pub type is ok with semantics" {
+    try std.testing.expectEqual(0, try lintWithSemantics(.Z012,
+        \\pub const Bar = struct { v: u8 };
+        \\const Foo = Bar;
+        \\pub fn getFoo() Foo { return .{ .v = 0 }; }
+    ));
+}
+
+test "Z012: local alias of primitive is ok with semantics" {
+    try std.testing.expectEqual(0, try lintWithSemantics(.Z012,
+        \\const Code = u40;
+        \\pub fn pack() Code { return 0; }
+    ));
+}
+
+test "Z012: alias of nested private type is flagged with semantics" {
+    // The resolver answers a field access on a user type as a std_type path,
+    // which read as an import and excused the alias.
+    try std.testing.expectEqual(1, try lintWithSemantics(.Z012,
+        \\pub const Outer = struct {
+        \\    const Inner = struct { v: u8 };
+        \\};
+        \\const Hidden = Outer.Inner;
+        \\pub fn make() Hidden { return .{ .v = 0 }; }
+    ));
+}
+
+test "Z012: alias of nested pub type is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\pub const Outer = struct {
+        \\    pub const Pub = struct { v: u8 };
+        \\};
+        \\const Shown = Outer.Pub;
+        \\pub fn make() Shown { return .{ .v = 0 }; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z012));
+}
+
+test "Z012: alias of nested private type is flagged" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\pub const Outer = struct {
+        \\    const Inner = struct { v: u8 };
+        \\};
+        \\const Hidden = Outer.Inner;
+        \\pub fn make() Hidden { return .{ .v = 0 }; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z012));
+}
+
+test "Z012: nested private type in signature is flagged" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\pub const Outer = struct {
+        \\    const Inner = struct { v: u8 };
+        \\};
+        \\pub fn make() Outer.Inner { return .{ .v = 0 }; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z012));
+}
+
+test "Z012: nested pub type in signature is ok" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\pub const Outer = struct {
+        \\    pub const Pub = struct { v: u8 };
+        \\};
+        \\pub fn make() Outer.Pub { return .{ .v = 0 }; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z012));
+}
+
+test "Z012: nested pub type under a private root is flagged" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Priv = struct {
+        \\    pub const Pub = struct { v: u8 };
+        \\};
+        \\pub fn make() Priv.Pub { return .{ .v = 0 }; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z012));
+}
+
+test "Z012: qualified std path in signature stays clean" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const std = @import("std");
+        \\pub fn dump(writer: std.fs.File.Writer) void { _ = writer; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z012));
+}
+
+test "Z012: alias of C ABI primitive is ok" {
+    // `c_uint` is a primitive, so `UINT` names nothing private.
+    var linter: Linter = .init(std.testing.allocator,
+        \\pub const UINT = c_uint;
+        \\pub fn setCp(cp: UINT) void { _ = cp; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(0, linter.diagnosticCount(.Z012));
+}
+
+test "Z012: one diagnostic per function, not per mention" {
+    var linter: Linter = .init(std.testing.allocator,
+        \\const Hidden = struct {};
+        \\pub fn f(a: Hidden, b: Hidden) void { _ = a; _ = b; }
+    , "test.zig", null);
+    defer linter.deinit();
+    linter.lint();
+    try std.testing.expectEqual(1, linter.diagnosticCount(.Z012));
 }
 
 test "Z012: non-pub fn returning private type is ok" {

@@ -13,6 +13,9 @@ const TypeResolver = @This();
 
 allocator: std.mem.Allocator,
 graph: *ModuleGraph,
+/// TypeInfos owned by pointer, slice, and optional children. Method lookup
+/// unwraps them, so they must name the pointee instead of being null.
+owned_types: std.ArrayList(*TypeInfo) = .empty,
 
 pub const TypeInfo = union(enum) {
     /// A primitive type like u32, bool, void
@@ -165,7 +168,21 @@ pub const MethodDef = struct {
 };
 
 pub fn deinit(self: *TypeResolver) void {
+    for (self.owned_types.items) |info| self.allocator.destroy(info);
+    self.owned_types.deinit(self.allocator);
     self.* = undefined;
+}
+
+/// Keeps `info` alive for the resolver's lifetime and hands out a pointer to
+/// it. TypeInfo children are optional pointers, and the resolver owns them.
+fn ownType(self: *TypeResolver, info: TypeInfo) ?*const TypeInfo {
+    const ptr = self.allocator.create(TypeInfo) catch return null;
+    ptr.* = info;
+    self.owned_types.append(self.allocator, ptr) catch {
+        self.allocator.destroy(ptr);
+        return null;
+    };
+    return ptr;
 }
 
 /// Resolves the type of an AST node within a module.
@@ -178,7 +195,19 @@ pub fn typeOf(self: *TypeResolver, module_path: []const u8, node: Ast.Node.Index
 /// For user_type, looks up the method in the type's module.
 /// For std_type, resolves the path through stdlib imports to find the type.
 pub fn findMethodDef(self: *TypeResolver, receiver_type: TypeInfo, method_name: []const u8) ?MethodDef {
-    switch (receiver_type) {
+    // `self: *Foo` is the usual receiver shape, and pointers and optionals are
+    // transparent for method lookup. Without the unwrap, `b.lazyDependency`
+    // (receiver `*std.Build`) answered nothing.
+    var receiver = receiver_type;
+    while (true) {
+        receiver = switch (receiver) {
+            .pointer => |p| (p.child orelse return null).*,
+            .optional => |o| (o.child orelse return null).*,
+            else => break,
+        };
+    }
+
+    switch (receiver) {
         .user_type => |u| {
             return self.findMethodInModule(u.module_path, u.name, method_name);
         },
@@ -660,8 +689,8 @@ fn resolveNodeType(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Index, 
         .unreachable_literal => .{ .primitive = .noreturn },
         .simple_var_decl, .aligned_var_decl, .local_var_decl, .global_var_decl => self.resolveVarDecl(tree, node, module_path),
         .fn_decl => self.resolveFnDecl(tree, node, module_path),
-        .optional_type => .{ .optional = .{ .child = null } },
-        .ptr_type_aligned, .ptr_type_sentinel, .ptr_type, .ptr_type_bit_range => self.resolvePtrType(tree, node),
+        .optional_type => .{ .optional = .{ .child = self.ownType(self.resolveNodeType(tree, tree.nodeData(node).node, module_path)) } },
+        .ptr_type_aligned, .ptr_type_sentinel, .ptr_type, .ptr_type_bit_range => self.resolvePtrType(tree, node, module_path),
         .error_union => .{ .error_union = .{ .payload = null } },
         .error_set_decl, .merge_error_sets => .error_set,
         .array_type, .array_type_sentinel => .{ .array = .{ .child = null, .len = null } },
@@ -1202,15 +1231,20 @@ fn resolveReturnType(self: *TypeResolver, tree: *const Ast, fn_proto: Ast.full.F
     return self.resolveNodeType(tree, ret_node, module_path);
 }
 
-fn resolvePtrType(_: *TypeResolver, tree: *const Ast, node: Ast.Node.Index) TypeInfo {
+fn resolvePtrType(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Index, module_path: []const u8) TypeInfo {
     const main_token = tree.nodeMainToken(node);
     const token_tag = tree.tokenTag(main_token);
 
+    // The child is resolved, not left null: `fn f(self: *Foo)` receivers are
+    // the common shape, and method lookup unwraps the pointer to `Foo`.
+    const ptr = tree.fullPtrType(node) orelse return .unknown;
+    const child = self.ownType(self.resolveNodeType(tree, ptr.ast.child_type, module_path));
+
     if (token_tag == .l_bracket) {
-        return .{ .slice = .{ .child = null } };
+        return .{ .slice = .{ .child = child } };
     }
 
-    return .{ .pointer = .{ .child = null, .is_const = false } };
+    return .{ .pointer = .{ .child = child, .is_const = false } };
 }
 
 fn resolveNumberLiteral(_: *TypeResolver, tree: *const Ast, node: Ast.Node.Index) TypeInfo {
