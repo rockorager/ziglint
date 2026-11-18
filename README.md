@@ -15,11 +15,18 @@ Directories are scanned recursively for `.zig` files.
 ### Options
 
 - `--zig-lib-path <path>` - Override the path to the Zig standard library (auto-detected from `zig env` if not specified)
+- `--explain <rule>` - Print the documentation for a rule (e.g., `Z024`)
+- `--list-rules` - List every rule with its title
 - `--only <rule>` - Lint only the specified rule (e.g., `Z001`). Can be repeated.
 - `--ignore <rule>` - Ignore a rule (e.g., `Z001`). Can be repeated.
 - `-h, --help` - Show help message
 
 ## Rules
+
+Run `ziglint --explain Z024` to read a rule's documentation in the terminal, or
+`ziglint --list-rules` to see every rule. The explanation is the same markdown
+that the doc tests execute; the header shows the settings your project
+overrides.
 
 | Code | Description |
 |------|-------------|

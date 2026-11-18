@@ -1,6 +1,7 @@
 //! Lint rule definitions with unique identifiers.
 
 const std = @import("std");
+const rule_docs = @import("rule_docs.zig");
 
 pub const Rule = enum(u16) {
     Z001 = 1,
@@ -72,6 +73,23 @@ pub const Rule = enum(u16) {
 
     pub fn code(self: Rule) []const u8 {
         return @tagName(self);
+    }
+
+    /// Long-form documentation embedded from src/docs/rules/<CODE>.md.
+    pub fn documentation(self: Rule) []const u8 {
+        return switch (self) {
+            inline else => |rule| rule_docs.get(@tagName(rule)),
+        };
+    }
+
+    /// Whether the rule is enabled when the config file says nothing.
+    pub fn defaultEnabled(self: Rule) bool {
+        inline for (@typeInfo(Rule).@"enum".fields) |field| {
+            if (field.value == @intFromEnum(self)) {
+                return @field(Rule.Config{}, field.name).enabled;
+            }
+        }
+        return true;
     }
 
     // ANSI escape codes
@@ -452,6 +470,19 @@ test "Z035 names the alias and the qualified path" {
     try Rule.Z035.writeMessage(&output.writer, "testing\x00std.testing", false);
 
     try std.testing.expectEqualStrings("use alias 'testing' instead of 'std.testing'", output.written());
+}
+
+test "every rule documents itself" {
+    inline for (@typeInfo(Rule).@"enum".fields) |field| {
+        const rule: Rule = @enumFromInt(field.value);
+        const meta = rule_docs.parseFrontmatter(rule.documentation());
+
+        try std.testing.expectEqualStrings(field.name, meta.rule orelse "");
+        try std.testing.expect(meta.title.len > 0);
+
+        const enabled = meta.enabled orelse return error.MissingEnabledInFrontmatter;
+        try std.testing.expectEqual(rule.defaultEnabled(), enabled);
+    }
 }
 
 test "Z034 recommends writeAll for literal prints" {

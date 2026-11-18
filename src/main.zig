@@ -7,6 +7,8 @@ pub const version = build_options.version;
 const FileConfig = @import("Config.zig");
 const Linter = @import("Linter.zig");
 const ModuleGraph = @import("ModuleGraph.zig");
+const explain = @import("explain.zig");
+const rule_docs = @import("rule_docs.zig");
 const rules = @import("rules.zig");
 const TypeResolver = @import("TypeResolver.zig");
 
@@ -17,6 +19,8 @@ pub const Config = struct {
     ignored_rules: []const rules.Rule = &.{},
     file_config: FileConfig = .{},
     verbose: bool = false,
+    explain_rule: ?rules.Rule = null,
+    list_rules: bool = false,
 };
 
 pub fn main(init: std.process.Init) !u8 {
@@ -42,6 +46,10 @@ pub fn main(init: std.process.Init) !u8 {
     // Load config file from first CLI path (or current directory)
     const start_path = if (config.paths.len > 0) config.paths[0] else null;
     config.file_config = FileConfig.load(allocator, io, start_path) catch .{};
+
+    if (config.explain_rule != null or config.list_rules) {
+        return printRuleHelp(io, &config, init.environ_map);
+    }
 
     applyOnlyRules(&config);
 
@@ -165,6 +173,18 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8, writer: *st
                 try writer.print("error: unknown rule code '{s}'\n", .{args[i]});
                 return error.InvalidArgs;
             }
+        } else if (std.mem.eql(u8, arg, "--explain")) {
+            i += 1;
+            if (i >= args.len) {
+                try writer.writeAll("error: --explain requires a rule code (e.g., Z024)\n");
+                return error.InvalidArgs;
+            }
+            config.explain_rule = parseRuleCode(args[i]) orelse {
+                try writer.print("error: unknown rule code '{s}'\n", .{args[i]});
+                return error.InvalidArgs;
+            };
+        } else if (std.mem.eql(u8, arg, "--list-rules")) {
+            config.list_rules = true;
         } else if (std.mem.eql(u8, arg, "--verbose")) {
             config.verbose = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -536,6 +556,25 @@ fn writeDiagnostics(diagnostics: []const Linter.Diagnostic, config: *const Confi
     return count;
 }
 
+/// Prints `--explain` / `--list-rules` output to stdout and returns the exit code.
+fn printRuleHelp(io: std.Io, config: *const Config, environ_map: *const std.process.Environ.Map) !u8 {
+    const stdout_file = std.Io.File.stdout();
+    const use_color = detectColorSupport(io, stdout_file, environ_map);
+
+    var buf: [8192]u8 = undefined;
+    var writer = stdout_file.writer(io, &buf);
+    const out = &writer.interface;
+    defer out.flush() catch {};
+
+    if (config.explain_rule) |rule| {
+        try explain.printRule(out, rule, &config.file_config, use_color);
+    } else {
+        try explain.printIndex(out, use_color);
+    }
+
+    return 0;
+}
+
 fn printUsage(writer: *std.Io.Writer) !void {
     try writer.writeAll(
         \\Usage: ziglint [options] <paths...>
@@ -543,6 +582,8 @@ fn printUsage(writer: *std.Io.Writer) !void {
         \\Lint Zig source files for style and correctness issues.
         \\
         \\Options:
+        \\  --explain <rule>      Print documentation for a rule (e.g., Z024).
+        \\  --list-rules          List all rules with their titles.
         \\  --only <rule>         Lint only this rule (e.g., Z001). Can be repeated.
         \\  --ignore <rule>       Ignore a rule (e.g., Z001). Can be repeated.
         \\  --zig-lib-path <path> Override the path to the Zig standard library.
@@ -568,6 +609,8 @@ test {
     _ = @import("doc_comments.zig");
     _ = @import("TypeResolver.zig");
     _ = @import("doc_tests.zig");
+    _ = explain;
+    _ = rule_docs;
 }
 
 test "parseLibDirFromZigEnv" {
@@ -586,6 +629,44 @@ test "parseLibDirFromZigEnv" {
 test "parseLibDirFromZigEnv: missing field" {
     const output = ".{ .zig_exe = \"/usr/bin/zig\" }";
     try std.testing.expectEqual(null, parseLibDirFromZigEnv(std.testing.allocator, output));
+}
+
+test "--explain parses a rule code" {
+    var buf: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    const config = try parseArgs(std.testing.allocator, &.{ "ziglint", "--explain", "Z024" }, &writer);
+
+    try std.testing.expectEqual(rules.Rule.Z024, config.explain_rule.?);
+    try std.testing.expect(!config.list_rules);
+}
+
+test "--explain without a code is an argument error" {
+    var buf: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+
+    try std.testing.expectError(
+        error.InvalidArgs,
+        parseArgs(std.testing.allocator, &.{ "ziglint", "--explain" }, &writer),
+    );
+}
+
+test "--explain rejects an unknown rule code" {
+    var buf: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+
+    try std.testing.expectError(
+        error.InvalidArgs,
+        parseArgs(std.testing.allocator, &.{ "ziglint", "--explain", "Z999" }, &writer),
+    );
+}
+
+test "--list-rules sets the flag" {
+    var buf: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buf);
+    const config = try parseArgs(std.testing.allocator, &.{ "ziglint", "--list-rules" }, &writer);
+
+    try std.testing.expect(config.list_rules);
+    try std.testing.expectEqual(null, config.explain_rule);
 }
 
 test "applyOnlyRules enables selected rules" {

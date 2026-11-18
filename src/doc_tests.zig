@@ -1,6 +1,6 @@
 //! Executable documentation tests.
 //!
-//! Parses markdown files in docs/rules/ and validates that code examples
+//! Parses the embedded rule documentation and validates that code examples
 //! produce the expected linter diagnostics. Similar to Go's example tests.
 //!
 //! Code blocks with `// expect: Z001` comments should trigger that rule.
@@ -11,6 +11,7 @@ const Linter = @import("Linter.zig");
 const ModuleGraph = @import("ModuleGraph.zig");
 const TypeResolver = @import("TypeResolver.zig");
 const rules = @import("rules.zig");
+const rule_docs = @import("rule_docs.zig");
 
 const DocTest = struct {
     code: []const u8,
@@ -197,45 +198,22 @@ fn runDocTest(allocator: std.mem.Allocator, doc_path: []const u8, doc_test: DocT
 }
 
 pub fn runAllDocTests(allocator: std.mem.Allocator) !void {
-    // Open docs/rules directory
-    const docs_path = "docs/rules";
-    var dir = std.Io.Dir.cwd().openDir(std.testing.io, docs_path, .{ .iterate = true }) catch |err| {
-        if (err == error.FileNotFound) {
-            std.debug.print("No docs/rules directory found, skipping doc tests\n", .{});
-            return;
-        }
-        return err;
-    };
-    defer dir.close(std.testing.io);
-
     // Create temp directory for semantic analysis
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    var file_count: usize = 0;
-    var test_count: usize = 0;
-    var iter = dir.iterate();
-    while (try iter.next(std.testing.io)) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".md")) continue;
-
-        const content = try dir.readFileAlloc(std.testing.io, entry.name, allocator, .limited(1024 * 1024));
-        defer allocator.free(content);
-
-        const doc = try parseMarkdown(allocator, content);
+    // Docs are embedded at compile time, so a rule without a doc file fails the
+    // build and no doc can be skipped at test time.
+    inline for (std.meta.fields(rules.Rule)) |field| {
+        const doc = try parseMarkdown(allocator, rule_docs.get(field.name));
         defer {
             for (doc.tests) |t| allocator.free(t.expected_rules);
             allocator.free(doc.tests);
         }
 
-        const full_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ docs_path, entry.name });
-        defer allocator.free(full_path);
-
         for (doc.tests) |doc_test| {
-            try runDocTest(allocator, full_path, doc_test, &tmp_dir);
-            test_count += 1;
+            try runDocTest(allocator, rule_docs.path(field.name), doc_test, &tmp_dir);
         }
-        file_count += 1;
     }
 }
 

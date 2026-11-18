@@ -109,9 +109,11 @@ Add the rule to the rules table in README.md, maintaining numerical order:
 | ZXXX | Brief description of what the rule checks |
 ```
 
-### Create Rule Documentation (`docs/rules/ZXXX.md`)
+### Create Rule Documentation (`src/docs/rules/ZXXX.md`)
 
-Create a detailed documentation file with executable examples:
+Create a detailed documentation file with executable examples. The file is
+embedded in the binary at compile time, so a rule without one fails to build,
+and `ziglint --explain ZXXX` prints it:
 
 ```markdown
 ---
@@ -162,6 +164,7 @@ Why this rule exists and what problems it prevents.
 **Key points:**
 - Code blocks with `// expect: ZXXX` comments are tested to trigger the rule
 - Code blocks without expect comments are tested to produce no warnings
+- The frontmatter `enabled` value must match the rule's default in `src/rules.zig`
 - These examples are validated by `zig build test` - if the rule changes and examples become inaccurate, the build fails
 - Include both bad (triggering) and good (passing) examples
 
